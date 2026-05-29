@@ -216,3 +216,21 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Qwen Code / IDE tooling
+.qwen/
+
+# Simulation outputs
+results/
+*.csv
+!data/profiling/**/*.csv
+*.png
+*.html
+*.json
+!examples/**/*.json
+
+# macOS
+.DS_Store
+
+# Profiling data too large for repo
+data/profiling/**/*.csv

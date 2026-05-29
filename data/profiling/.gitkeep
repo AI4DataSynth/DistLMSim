@@ -1,0 +1,14 @@
+# Profiling data placeholder
+# 
+# 目录结构:
+# compute/{device}/{model_name}/
+#   - attention.csv
+#   - mlp.csv
+#   - expert.csv
+#   - eplb.csv
+#
+# network/{network_device}/
+#   - all_reduce.csv     (NVLink all-reduce profiling)
+#   - send_recv.csv      (PP send/recv profiling)
+#   - expert_comm.csv    (EP all-to-all profiling)
+#   - rdma_transfer.csv  (RDMA 传输 profiling, 后续采集)
