@@ -234,3 +234,6 @@ results/
 
 # Profiling data too large for repo
 data/profiling/**/*.csv
+
+# Unit tests (run locally with: python3 tests/run_tests.py)
+tests/
