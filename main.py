@@ -32,6 +32,7 @@ from distlmsim.execution.execution_time_predictor import AnalyticalPredictor
 from distlmsim.topology.nvlink_model import NVLinkModel
 from distlmsim.topology.rdma_model import RDMAModel
 from distlmsim.metrics.metrics_store import MetricsStore
+from distlmsim.scheduling.advanced_schedulers import AdvancedSchedulers
 
 logger = logging.getLogger(__name__)
 
@@ -95,9 +96,13 @@ class DisaggregatedSimulator:
     - ljf:    Longest-Job-First (按 prefill tokens 降序)
     - srtf:   Shortest-Remaining-Time-First (按 decode tokens 升序)
     - random: 随机排序
+    - mlfq:   Multi-Level Feedback Queue (多级反馈队列)
+    - po:     Priority Ordering (短作业 FCFS + 长作业 SJF)
+    - opt:    Optimal (Score = remaining_tokens × noise_factor)
+    - lightllm: LightLLM (分离 prefill/decode batch)
     """
 
-    SUPPORTED_SCHEDULERS = ("fcfs", "sjf", "ljf", "srtf", "random")
+    SUPPORTED_SCHEDULERS = ("fcfs", "sjf", "ljf", "srtf", "random", "mlfq", "po", "opt", "lightllm")
 
     def __init__(
         self,
@@ -112,6 +117,7 @@ class DisaggregatedSimulator:
         self._rng = np.random.default_rng(config.seed)
         self._prefill_policy = prefill_schedule_policy
         self._decode_policy = decode_schedule_policy
+        self._advanced_schedulers = AdvancedSchedulers(seed=config.seed)
 
     def _create_request(self, arrival_time: float) -> Request:
         """创建一个合成请求。"""
@@ -229,6 +235,7 @@ class DisaggregatedSimulator:
         batch_size: int,
         policy: str,
         kv_ready_time: Optional[Dict[int, float]] = None,
+        current_time: float = 0.0,
     ) -> List[Request]:
         """从等待队列中按策略选取最多 batch_size 个请求。
 
@@ -256,6 +263,33 @@ class DisaggregatedSimulator:
             elif policy == "random":
                 indices = self._rng.choice(len(waiting_queue), size=batch_size, replace=False)
                 selected = [waiting_queue[i] for i in indices]
+            elif policy == "mlfq":
+                # 多级反馈队列
+                selected = self._advanced_schedulers.select_mlfq(
+                    waiting_queue, batch_size, current_time
+                )
+            elif policy == "po":
+                # 优先级排序 (短作业 FCFS + 长作业 SJF)
+                selected = self._advanced_schedulers.select_po(
+                    waiting_queue, batch_size
+                )
+            elif policy == "opt":
+                # 最优调度 (Score = remaining_tokens × noise_factor)
+                selected = self._advanced_schedulers.select_opt(
+                    waiting_queue, batch_size, current_time
+                )
+            elif policy == "lightllm":
+                # LightLLM (分离 prefill/decode batch)
+                # 根据是否已有 generated tokens 判断是 prefill 还是 decode
+                has_prefilled = any(r.num_generated_tokens > 0 for r in waiting_queue)
+                if has_prefilled:
+                    selected = self._advanced_schedulers.select_lightllm_decode(
+                        waiting_queue, batch_size
+                    )
+                else:
+                    selected = self._advanced_schedulers.select_lightllm_prefill(
+                        waiting_queue, batch_size, current_time
+                    )
             else:
                 selected = waiting_queue[:batch_size]
 
@@ -322,7 +356,10 @@ class DisaggregatedSimulator:
                 continue
 
             # 按调度策略从队列中选取
-            batch = self._select_from_queue(prefill_waiting, prefill_bs, self._prefill_policy)
+            batch = self._select_from_queue(
+                prefill_waiting, prefill_bs, self._prefill_policy,
+                current_time=current_time
+            )
             for req in batch:
                 prefill_waiting.remove(req)
 
@@ -385,7 +422,9 @@ class DisaggregatedSimulator:
 
             # 按调度策略从队列中选取
             decode_batch = self._select_from_queue(
-                decode_waiting, decode_bs, self._decode_policy, kv_ready_time
+                decode_waiting, decode_bs, self._decode_policy,
+                kv_ready_time=kv_ready_time,
+                current_time=current_time
             )
             for req in decode_batch:
                 decode_waiting.remove(req)

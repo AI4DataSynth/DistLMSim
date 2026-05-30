@@ -12,17 +12,25 @@
   使请求在 prefill 节点处理当前 batch 期间持续积累, 调度器才有选择空间。
 
 调度策略:
-  1. FCFS  — First-Come-First-Served, 按到达时间选取 (基线)
-  2. SJF   — Shortest-Job-First, 按 prefill tokens 升序 (优化平均 TTFT)
-  3. LJF   — Longest-Job-First, 按 prefill tokens 降序 (反面参照)
-  4. SRTF  — Shortest-Remaining-Time-First, 按 decode tokens 升序 (优化 E2E)
-  5. Random — 随机选取 (无策略基线)
+  1. FCFS      — First-Come-First-Served, 按到达时间选取 (基线)
+  2. SJF       — Shortest-Job-First, 按 prefill tokens 升序 (优化平均 TTFT)
+  3. LJF       — Longest-Job-First, 按 prefill tokens 降序 (反面参照)
+  4. SRTF      — Shortest-Remaining-Time-First, 按 decode tokens 升序 (优化 E2E)
+  5. Random    — 随机选取 (无策略基线)
+  6. MLFQ      — Multi-Level Feedback Queue, 多级反馈队列 (TRADIOS)
+  7. PO        — Priority Ordering, 短作业 FCFS + 长作业 SJF (TRADIOS)
+  8. OPT       — Optimal, Score = remaining_tokens × noise (TRADIOS)
+  9. LightLLM  — 分离 prefill/decode batch (TRADIOS)
 
 预期结果:
   - SJF/SRTF: 显著降低 TTFT/E2E 的 P50 (短请求跳队), 但 P99 升高 (长请求饥饿)
   - LJF: TTFT/E2E 全面劣化 (head-of-line blocking)
   - FCFS: 均衡但非最优, 尾延迟比 SJF 低
   - Random: 介于 FCFS 和 SJF 之间
+  - MLFQ: 接近 FCFS (初始阶段未充分提升)
+  - PO: 介于 SJF 和 FCFS 之间, 短作业优先但长作业也有保障
+  - OPT: 类似 SJF 但有噪声, 尾延迟比 SJF 低
+  - LightLLM: 接近 FCFS (分离 batch 效果在单节点不明显)
 
 用法:
   python3 examples/experiment_schedulers.py
@@ -47,11 +55,15 @@ logger = logging.getLogger(__name__)
 # ─── 实验配置 ─────────────────────────────────────────────────────────────────
 
 SCHEDULERS = [
-    ("fcfs",   "FCFS",   "先到先服务"),
-    ("sjf",    "SJF",    "短 prefill 优先"),
-    ("ljf",    "LJF",    "长 prefill 优先"),
-    ("srtf",   "SRTF",   "短 decode 优先"),
-    ("random", "Random", "随机"),
+    ("fcfs",      "FCFS",      "先到先服务"),
+    ("sjf",       "SJF",       "短 prefill 优先"),
+    ("ljf",       "LJF",       "长 prefill 优先"),
+    ("srtf",      "SRTF",      "短 decode 优先"),
+    ("random",    "Random",    "随机"),
+    ("mlfq",      "MLFQ",      "多级反馈队列"),
+    ("po",        "PO",        "优先级排序"),
+    ("opt",       "OPT",       "最优调度"),
+    ("lightllm",  "LightLLM",  "分离 batch"),
 ]
 
 
