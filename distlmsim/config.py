@@ -175,9 +175,14 @@ class RequestGeneratorConfig:
     decode_length: int = 512            # 平均 decode token 数
     # Trace 回放
     trace_file: Optional[str] = None
+    # 请求到达间隔分布
+    interval_distribution: str = "poisson"  # poisson, gamma
+    gamma_shape: float = 2.0            # Gamma 分布 shape 参数 k (gamma 模式)
     # 请求长度分布
     length_distribution: str = "normal"  # fixed, normal, lognormal
+    length_generator_type: str = "normal"  # fixed, normal, zipf
     length_cv: float = 0.3              # 变异系数 (normal/lognormal)
+    zipf_alpha: float = 1.5             # Zipf 分布 alpha 参数 (zipf 模式)
 
 
 # ─── 指标配置 ─────────────────────────────────────────────────────────────────

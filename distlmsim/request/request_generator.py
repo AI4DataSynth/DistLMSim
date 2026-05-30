@@ -1,13 +1,14 @@
 """请求生成器
 
 生成模拟推理请求，支持合成流量和 trace 回放两种模式。
+支持多种到达间隔分布（Poisson/Gamma）和长度分布（Fixed/Normal/Lognormal/Zipf）。
 """
 
 from __future__ import annotations
 
 import itertools
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -17,6 +18,118 @@ from distlmsim.events import BaseEvent, RequestArrivalEvent
 
 
 _request_id_counter = itertools.count()
+
+
+# ─── 到达间隔生成器 ────────────────────────────────────────────────────────────
+
+
+class BaseIntervalGenerator(ABC):
+    """到达间隔生成器基类。"""
+
+    @abstractmethod
+    def sample(self, rng: np.random.Generator) -> float:
+        """采样一个到达间隔（秒）。"""
+        ...
+
+
+class PoissonIntervalGenerator(BaseIntervalGenerator):
+    """泊松过程到达间隔（指数分布）。"""
+
+    def __init__(self, qps: float):
+        self._qps = qps
+
+    def sample(self, rng: np.random.Generator) -> float:
+        if self._qps <= 0:
+            return float("inf")
+        return float(rng.exponential(1.0 / self._qps))
+
+
+class GammaIntervalGenerator(BaseIntervalGenerator):
+    """Gamma 分布到达间隔。
+
+    Gamma(k, scale) 其中 scale = 1 / (k * qps)，使得均值 = 1/qps。
+    shape k 越大，间隔越集中（接近确定性）；k=1 退化为指数分布。
+    """
+
+    def __init__(self, qps: float, shape: float = 2.0):
+        self._qps = qps
+        self._shape = shape  # k
+
+    def sample(self, rng: np.random.Generator) -> float:
+        if self._qps <= 0:
+            return float("inf")
+        scale = 1.0 / (self._shape * self._qps)
+        return float(rng.gamma(self._shape, scale))
+
+
+# ─── 长度生成器 ────────────────────────────────────────────────────────────────
+
+
+class BaseLengthGenerator(ABC):
+    """请求长度生成器基类。"""
+
+    @abstractmethod
+    def sample(self, mean: int, rng: np.random.Generator) -> int:
+        """采样一个请求长度。"""
+        ...
+
+
+class FixedLengthGenerator(BaseLengthGenerator):
+    """固定长度。"""
+
+    def sample(self, mean: int, rng: np.random.Generator) -> int:
+        return mean
+
+
+class NormalLengthGenerator(BaseLengthGenerator):
+    """正态分布长度。"""
+
+    def __init__(self, cv: float = 0.3):
+        self._cv = cv
+
+    def sample(self, mean: int, rng: np.random.Generator) -> int:
+        std = mean * self._cv
+        return max(1, int(rng.normal(mean, std)))
+
+
+class LognormalLengthGenerator(BaseLengthGenerator):
+    """对数正态分布长度。"""
+
+    def __init__(self, cv: float = 0.3):
+        self._cv = cv
+
+    def sample(self, mean: int, rng: np.random.Generator) -> int:
+        cv = self._cv
+        sigma = np.sqrt(np.log(1 + cv ** 2))
+        mu = np.log(mean) - sigma ** 2 / 2
+        return max(1, int(rng.lognormal(mu, sigma)))
+
+
+class ZipfLengthGenerator(BaseLengthGenerator):
+    """Zipf 分布长度。
+
+    Zipf 分布产生幂律分布的长尾值。
+    采样后缩放使得均值接近目标 mean。
+    """
+
+    def __init__(self, alpha: float = 1.5):
+        self._alpha = alpha
+
+    def sample(self, mean: int, rng: np.random.Generator) -> int:
+        # numpy zipf 采样 (a > 1)，值从 1 开始
+        raw = rng.zipf(self._alpha)
+        # Zipf(a) 的期望 = zeta(a-1) / zeta(a) (a > 2 时有限)
+        # 简单方法：缩放使得期望接近 mean
+        # 对于 a=1.5, E[X] 约 3.6，缩放因子 = mean / E[X_approx]
+        # 使用近似缩放
+        if self._alpha > 2:
+            from scipy.special import zeta as _zeta
+            expected = _zeta(self._alpha - 1) / _zeta(self._alpha)
+        else:
+            # 近似：对于 a=1.5，经验值约 3.6
+            expected = max(1.0, 1.0 / (1.0 - 1.0 / self._alpha) if self._alpha > 1 else 1.0)
+        scaled = max(1, int(raw * mean / expected))
+        return scaled
 
 
 class BaseRequestGenerator(ABC):
@@ -43,13 +156,38 @@ class BaseRequestGenerator(ABC):
 class SyntheticRequestGenerator(BaseRequestGenerator):
     """合成请求生成器。
 
-    使用泊松过程生成请求到达间隔，正态/对数正态分布生成长度。
+    支持多种到达间隔分布（poisson/gamma）和长度分布（fixed/normal/lognormal/zipf）。
     """
 
     def __init__(self, config: RequestGeneratorConfig):
         self._config = config
         self._rng = np.random.default_rng(42)
         self._next_arrival_time = 0.0
+
+        # 初始化到达间隔生成器
+        self._interval_gen: BaseIntervalGenerator = self._create_interval_generator(config)
+        # 初始化长度生成器
+        self._length_gen: BaseLengthGenerator = self._create_length_generator(config)
+
+    @staticmethod
+    def _create_interval_generator(config: RequestGeneratorConfig) -> BaseIntervalGenerator:
+        """根据配置创建到达间隔生成器。"""
+        if config.interval_distribution == "gamma":
+            return GammaIntervalGenerator(config.qps, shape=config.gamma_shape)
+        return PoissonIntervalGenerator(config.qps)
+
+    @staticmethod
+    def _create_length_generator(config: RequestGeneratorConfig) -> BaseLengthGenerator:
+        """根据配置创建长度生成器。"""
+        gen_type = config.length_generator_type
+        if gen_type == "fixed":
+            return FixedLengthGenerator()
+        elif gen_type == "zipf":
+            return ZipfLengthGenerator(alpha=config.zipf_alpha)
+        elif gen_type == "lognormal":
+            return LognormalLengthGenerator(cv=config.length_cv)
+        else:  # "normal" (default)
+            return NormalLengthGenerator(cv=config.length_cv)
 
     def generate_initial_events(self) -> List[BaseEvent]:
         """生成第一批请求。"""
@@ -68,11 +206,8 @@ class SyntheticRequestGenerator(BaseRequestGenerator):
         return RequestArrivalEvent(arrival_time, request_id)
 
     def _sample_interval(self) -> float:
-        """采样请求到达间隔 (ms)。泊松过程 -> 指数分布。"""
-        qps = self._config.qps
-        if qps <= 0:
-            return float("inf")
-        interval_s = self._rng.exponential(1.0 / qps)
+        """采样请求到达间隔 (ms)。"""
+        interval_s = self._interval_gen.sample(self._rng)
         return interval_s * 1e3  # 转换为 ms
 
     def create_request(self, arrival_time: float) -> Request:
@@ -88,20 +223,58 @@ class SyntheticRequestGenerator(BaseRequestGenerator):
         )
 
     def _sample_length(self, mean: int) -> int:
-        """采样请求长度。"""
-        dist = self._config.length_distribution
-        if dist == "fixed":
-            return mean
-        elif dist == "normal":
-            std = mean * self._config.length_cv
-            return max(1, int(self._rng.normal(mean, std)))
-        elif dist == "lognormal":
-            # 对数正态: 给定 mean 和 cv，反推 mu 和 sigma
-            cv = self._config.length_cv
-            sigma = np.sqrt(np.log(1 + cv ** 2))
-            mu = np.log(mean) - sigma ** 2 / 2
-            return max(1, int(self._rng.lognormal(mu, sigma)))
-        return mean
+        """采样请求长度。委托给长度生成器。"""
+        return self._length_gen.sample(mean, self._rng)
+
+    def generate_expert_distributions(
+        self,
+        num_layers: int = 48,
+        num_experts: int = 128,
+        alpha: float = 1.5,
+    ) -> Tuple[np.ndarray, List[np.ndarray]]:
+        """生成 MoE 专家路由分布。
+
+        使用 Zipf-like 分布模拟专家热门程度：少数专家被频繁选中，
+        大部分专家较少被选中。
+
+        Args:
+            num_layers: 模型层数
+            num_experts: 每层专家数
+            alpha: Zipf 分布参数（越大越不均匀）
+
+        Returns:
+            (prefill_expert_distribution, decode_expert_distributions)
+            - prefill_expert_distribution: shape [num_layers, num_experts]
+            - decode_expert_distributions: list of [num_layers, num_experts]，
+              每个 decode step 一个分布
+        """
+        # 生成基础 Zipf 权重: w_i = 1 / i^alpha，然后归一化
+        ranks = np.arange(1, num_experts + 1, dtype=np.float64)
+        weights = 1.0 / np.power(ranks, alpha)
+        weights /= weights.sum()
+
+        # prefill 分布：每层打乱专家顺序（模拟不同层的 router 偏好）
+        prefill_dist = np.zeros((num_layers, num_experts), dtype=np.float64)
+        for layer in range(num_layers):
+            perm = self._rng.permutation(num_experts)
+            prefill_dist[layer] = weights[perm]
+
+        # decode 分布：每个 decode step 略有变化（模拟动态路由）
+        # 生成一个基础分布，然后在各 step 间添加微小扰动
+        num_decode_steps = self._config.decode_length
+        decode_dists: List[np.ndarray] = []
+        for _step in range(num_decode_steps):
+            step_dist = np.zeros((num_layers, num_experts), dtype=np.float64)
+            for layer in range(num_layers):
+                # 在基础权重上添加微小噪声
+                noise = self._rng.dirichlet(np.ones(num_experts) * 10.0)
+                mixed = 0.8 * weights + 0.2 * noise
+                mixed /= mixed.sum()
+                perm = self._rng.permutation(num_experts)
+                step_dist[layer] = mixed[perm]
+            decode_dists.append(step_dist)
+
+        return prefill_dist, decode_dists
 
 
 class TraceReplayRequestGenerator(BaseRequestGenerator):
