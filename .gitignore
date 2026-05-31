@@ -219,6 +219,7 @@ __marimo__/
 
 # Qwen Code / IDE tooling
 .qwen/
+QWEN.md
 
 # Simulation outputs
 results/
