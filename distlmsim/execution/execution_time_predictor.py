@@ -48,11 +48,20 @@ class ExecutionTimePredictor(ABC):
 
 
 class AnalyticalPredictor(ExecutionTimePredictor):
-    """解析模型预测器。
+    """解析模型预测器 (含 Roofline 模型)。
 
-    基于 GPU FLOPS 和内存带宽的理论计算。
-    适用于快速原型验证，无需 profiling 数据。
+    基于 Roofline 模型: time = max(compute_time, memory_time)
+    - compute_time = FLOPS / (peak_FLOPS * compute_efficiency)
+    - memory_time  = bytes  / (memory_bandwidth * memory_efficiency)
+
+    对 prefill (compute-bound) 和 decode (memory-bound) 均适用。
     """
+
+    # Roofline 效率因子
+    COMPUTE_EFFICIENCY = 0.85
+    MEMORY_EFFICIENCY = 0.90
+    # FP16 每元素字节数
+    BPE = 2
 
     def __init__(
         self,
@@ -62,6 +71,16 @@ class AnalyticalPredictor(ExecutionTimePredictor):
         self._model = model_config
         self._device = device_config
 
+    def _roofline_time_ms(
+        self, flops: int, memory_bytes: int,
+    ) -> float:
+        """Roofline 模型: time = max(compute, memory)"""
+        peak_flops = self._device.fp16_tflops * 1e12
+        mem_bw = self._device.memory_bandwidth_gbps * 1e9  # GB/s → bytes/s
+        compute_ms = flops / (peak_flops * self.COMPUTE_EFFICIENCY) * 1e3
+        memory_ms = memory_bytes / (mem_bw * self.MEMORY_EFFICIENCY) * 1e3
+        return max(compute_ms, memory_ms)
+
     def get_execution_time(
         self,
         num_tokens: int,
@@ -69,49 +88,74 @@ class AnalyticalPredictor(ExecutionTimePredictor):
         kv_cache_size: int,
         is_prefill: bool,
     ) -> ExecutionTime:
-        # 理论计算
-        # 计算时间 = FLOPs / GPU_FLOPS
-        # 内存时间 = data_bytes / memory_bandwidth
+        m = self._model
+        h = m.embedding_dim
+        hd = h // m.num_q_heads
+        nq = m.num_q_heads
+        nkv = m.num_kv_heads
+        mlp_hidden = m.mlp_hidden_dim or int(h * 8 / 3)
+        bpe = self.BPE
 
-        head_dim = self._model.embedding_dim // self._model.num_q_heads
+        # --- QKV 投影 (per layer) ---
+        qkv_out_dim = (nq + 2 * nkv) * hd
+        qkv_flops = 2 * num_tokens * h * qkv_out_dim
+        qkv_mem = (h * qkv_out_dim + num_tokens * h + num_tokens * qkv_out_dim) * bpe
+        qkv_time = self._roofline_time_ms(qkv_flops, qkv_mem)
 
-        # Attention 计算量 (per layer)
-        # Q projection: 2 * tokens * embd * (q_heads * head_dim)
-        qkv_flops = 2 * num_tokens * self._model.embedding_dim * (
-            self._model.num_q_heads + 2 * self._model.num_kv_heads
-        ) * head_dim
-        # Attention scores: 2 * tokens * q_heads * kv_len * head_dim (prefill)
-        #                  2 * batch_size * q_heads * kv_len * head_dim (decode)
+        # --- Attention (per layer) ---
         if is_prefill:
-            attn_flops = 2 * num_tokens * self._model.num_q_heads * num_tokens * head_dim
+            attn_flops = 4 * num_tokens * nq * num_tokens * hd
+            attn_mem = (3 * num_tokens * nq * hd + num_tokens * nq * hd) * bpe
         else:
-            attn_flops = 2 * batch_size * self._model.num_q_heads * kv_cache_size * head_dim
+            attn_flops = 4 * batch_size * nq * kv_cache_size * hd
+            # KV cache 读取: 2 * batch * nkv * kv_len * hd
+            kv_read = 2 * batch_size * nkv * kv_cache_size * hd * bpe
+            q_read = batch_size * nq * hd * bpe
+            out_write = batch_size * nq * hd * bpe
+            attn_mem = kv_read + q_read + out_write
+        attn_time = self._roofline_time_ms(attn_flops, attn_mem)
 
-        # MLP (gated): 3 * 2 * tokens * embd * mlp_hidden
-        mlp_hidden = self._model.mlp_hidden_dim or int(self._model.embedding_dim * 8 / 3)
-        mlp_flops = 3 * 2 * num_tokens * self._model.embedding_dim * mlp_hidden
+        # --- O 投影 (per layer) ---
+        o_flops = 2 * num_tokens * (nq * hd) * h
+        o_mem = (nq * hd * h + num_tokens * nq * hd + num_tokens * h) * bpe
+        o_time = self._roofline_time_ms(o_flops, o_mem)
 
-        total_flops = qkv_flops + attn_flops + mlp_flops
-        gpu_flops_per_s = self._device.fp16_tflops * 1e12
-        compute_time_ms = total_flops / gpu_flops_per_s * 1e3
+        # --- MLP (SwiGLU, per layer) ---
+        # gate + up: 2 个线性层, down: 1 个线性层
+        gate_up_flops = 2 * 2 * num_tokens * h * mlp_hidden
+        gate_up_mem = (2 * h * mlp_hidden + num_tokens * h + 2 * num_tokens * mlp_hidden) * bpe
+        gate_up_time = self._roofline_time_ms(gate_up_flops, gate_up_mem)
 
-        # 简单分配各子阶段
-        attn_ratio = (qkv_flops + attn_flops) / total_flops
-        mlp_ratio = mlp_flops / total_flops
+        down_flops = 2 * num_tokens * mlp_hidden * h
+        down_mem = (mlp_hidden * h + num_tokens * mlp_hidden + num_tokens * h) * bpe
+        down_time = self._roofline_time_ms(down_flops, down_mem)
+
+        # --- 小操作 (norm, rope, add, activation) ---
+        # 这些是 memory-bound, 按数据量估算
+        small_bytes = num_tokens * h * bpe
+        mem_bw = self._device.memory_bandwidth_gbps * 1e9 * self.MEMORY_EFFICIENCY
+        norm_time = small_bytes / mem_bw * 1e3  # 一次 norm
+        rope_time = small_bytes / mem_bw * 1e3 * 0.5
+        add_time = small_bytes / mem_bw * 1e3 * 0.3
+        act_time = num_tokens * mlp_hidden * bpe / mem_bw * 1e3  # SiLU
+
+        # KV cache save
+        kv_save_bytes = 2 * batch_size * nkv * hd * bpe  # K + V 写入
+        kv_save_time = kv_save_bytes / mem_bw * 1e3
 
         return ExecutionTime(
-            attn_pre_proj_time=compute_time_ms * attn_ratio * 0.3,
-            attn_rope_time=compute_time_ms * 0.02,
-            attn_kv_cache_save_time=compute_time_ms * 0.05,
-            attn_prefill_time=compute_time_ms * attn_ratio * 0.5 if is_prefill else 0.0,
-            attn_decode_time=compute_time_ms * attn_ratio * 0.5 if not is_prefill else 0.0,
-            attn_post_proj_time=compute_time_ms * attn_ratio * 0.2,
-            mlp_up_proj_time=compute_time_ms * mlp_ratio * 0.4,
-            mlp_act_time=compute_time_ms * mlp_ratio * 0.1,
-            mlp_down_proj_time=compute_time_ms * mlp_ratio * 0.4,
-            input_layernorm_time=compute_time_ms * 0.01,
-            post_attention_layernorm_time=compute_time_ms * 0.01,
-            add_time=compute_time_ms * 0.01,
+            attn_pre_proj_time=qkv_time * 0.5,
+            attn_rope_time=rope_time,
+            attn_kv_cache_save_time=kv_save_time,
+            attn_prefill_time=attn_time if is_prefill else 0.0,
+            attn_decode_time=attn_time if not is_prefill else 0.0,
+            attn_post_proj_time=o_time,
+            mlp_up_proj_time=gate_up_time * 0.5,
+            mlp_act_time=act_time,
+            mlp_down_proj_time=down_time,
+            input_layernorm_time=norm_time,
+            post_attention_layernorm_time=norm_time,
+            add_time=add_time,
         )
 
 
