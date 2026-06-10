@@ -178,10 +178,15 @@ Example comparison (Zipf α=1.5, 128 experts, EP=8):
 
 ```
 Default     : max=868  avg=125  deviation=743.0
-EPLB        : max=138  avg=125  deviation=743.0
-Realistic   : max=314  avg=125  migrations=0
-OmniPlace   : max=858  avg=125  migrations=4
+EPLB        : max=138  avg=125  (capacity-truncated; effective deviation=13.0)
+Realistic   : max=314  avg=125  migrations=0  (single batch, no rebalance triggered)
+OmniPlace   : max=858  avg=125  migrations=4  (budget_N=4, limited swaps)
 ```
+
+> **Note:** EPLB reports raw (pre-truncation) deviation. RealisticEPLB and OmniPlacement
+> effectiveness depends on configuration: rebalance frequency, redundant expert count,
+> and swap budget. With adequate budget they outperform Default; the example above uses
+> conservative defaults to show baseline behavior.
 
 ## Project Structure
 
@@ -197,14 +202,15 @@ DistLMSim/
 │   │   ├── network_topology.py      #   Topology graph
 │   │   ├── nvlink_model.py          #   NVLink/NVSwitch model
 │   │   ├── rdma_model.py            #   RDMA model (RoCEv2/IB)
-│   │   └── communication_cost.py    #   Communication cost calculator
+│   │   ├── communication_cost.py    #   Communication cost calculator
+│   │   └── overlap_processor.py     #   Communication-computation overlap model
 │   ├── cluster/                     # Cluster management
 │   │   ├── node.py                  #   Physical nodes
 │   │   ├── cluster.py               #   Cluster abstraction
 │   │   └── resource_manager.py      #   GPU resource allocation
 │   ├── scheduling/                  # Distributed scheduling
-│   │   ├── global_scheduler.py      #   Global scheduling (RR/Random/LOR/topology-aware)
-│   │   ├── replica_scheduler.py     #   Replica-level scheduling (Sarathi/vLLM/Orca)
+│   │   ├── global_scheduler.py      #   Global scheduling (RR/Random/LOR; topology-aware*)
+│   │   ├── replica_scheduler.py     #   Replica-level scheduling (Sarathi*/vLLM*/Orca*)
 │   │   ├── advanced_schedulers.py   #   MLFQ/PO/OPT/LightLLM schedulers
 │   │   ├── disaggregated_scheduler.py # Disaggregated prefill/decode scheduling
 │   │   └── migration.py             #   Request migration
@@ -214,15 +220,22 @@ DistLMSim/
 │   │   ├── expert_parallel.py       #   EP (cross-node All-to-All) + MoE load balancing
 │   │   └── parallelism_planner.py   #   Parallelism strategy planner
 │   ├── execution/                   # Execution time prediction
-│   │   ├── execution_time_predictor.py # Compute time (analytical/profiling/RF)
+│   │   ├── execution_time_predictor.py # Compute time (Roofline analytical/profiling/RF)
 │   │   └── network_time_predictor.py   # Network time prediction
 │   ├── request/                     # Request generation
 │   │   └── request_generator.py     #   Synthetic/Trace replay + MoE expert distributions
-│   └── metrics/                     # Metrics collection
-│       └── metrics_store.py         #   TTFT/TBT/E2E/throughput metrics
-├── tests/                           # Unit tests (210 tests)
+│   ├── metrics/                     # Metrics collection
+│   │   └── metrics_store.py         #   TTFT/TBT/E2E/throughput metrics
+│   ├── analysis/                    # Analysis modules (ported from Charon)
+│   │   ├── memory_analysis.py       #   Per-GPU inference memory estimation + OOM detection
+│   │   ├── mfu_analysis.py          #   Model FLOPs Utilization for prefill/decode
+│   │   └── timeline_analysis.py     #   Chrome Trace JSON timeline generation
+│   └── design/                      # Design space exploration (ported from Charon)
+│       └── design_space_explorer.py #   TP/EP/scheduler enumeration + Pareto analysis
+├── tests/                           # Unit tests (313 tests)
 │   ├── run_tests.py                 #   Test runner
 │   ├── test_config.py               #   Configuration tests
+│   ├── test_types.py                #   Enum type tests
 │   ├── test_entities.py             #   Entity tests
 │   ├── test_topology.py             #   Topology tests
 │   ├── test_cluster.py              #   Cluster tests
@@ -230,13 +243,22 @@ DistLMSim/
 │   ├── test_parallelism.py          #   Parallelism tests
 │   ├── test_execution.py            #   Execution predictor tests
 │   ├── test_metrics.py              #   Metrics tests
-│   └── test_e2e.py                  #   End-to-end tests
+│   ├── test_e2e.py                  #   End-to-end tests
+│   ├── test_memory_analysis.py      #   Memory analysis tests
+│   ├── test_mfu_analysis.py         #   MFU analysis tests
+│   ├── test_timeline_analysis.py    #   Timeline analysis tests
+│   ├── test_overlap_processor.py    #   Overlap processor tests
+│   ├── test_design_space_explorer.py #  Design space exploration tests
+│   └── test_roofline_model.py       #   Roofline model tests
 ├── data/profiling/                  # Profiling data (to be populated)
 └── examples/
     ├── demo_disaggregated.py        # Disaggregated prefill/decode demo
     ├── experiment_schedulers.py     # Scheduler comparison experiment
-    └── demo_2node_tp4_pp2.py        # Parallelism planning demo
+    ├── demo_2node_tp4_pp2.py        # Parallelism planning demo
+    └── visualize_results.py         # Result visualization script
 ```
+
+> `*` Starred items indicate stub/partial implementations. See [Implementation Status](#implementation-status) below.
 
 ## Dependencies
 
@@ -250,7 +272,7 @@ pip install numpy
 ## Running Tests
 
 ```bash
-# Run all 210 unit tests
+# Run all 313 unit tests
 python3 tests/run_tests.py
 
 # Run specific test file
@@ -259,6 +281,23 @@ python3 -m unittest tests/test_scheduling.py
 # Run with verbose output
 python3 -m unittest tests/test_e2e.py -v
 ```
+
+## Implementation Status
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| 9 scheduling policies (FCFS–LightLLM) | ✅ Complete | All implemented and tested |
+| 4 MoE load balancing strategies | ✅ Complete | All implemented and tested |
+| NVLink/RDMA communication models | ✅ Complete | Analytical + profiling modes |
+| Communication-computation overlap | ✅ Complete | Ratio-based + bandwidth-aware |
+| Roofline execution time predictor | ✅ Complete | Compute/memory-bound modeling |
+| Memory analysis | ✅ Complete | KV cache, OOM detection |
+| MFU analysis | ✅ Complete | Prefill/decode FLOPs utilization |
+| Chrome Trace timeline | ✅ Complete | Chrome Trace Viewer compatible |
+| Design space exploration | ✅ Complete | Pareto frontier + SLO constraints |
+| Replica schedulers (Sarathi/vLLM/Orca) | ⚠️ Stub | `form_batch()` raises `NotImplementedError`; scheduling is handled in `main.py` |
+| TopologyAware global scheduler | ⚠️ Stub | Falls back to RoundRobin |
+| Event-driven simulator (`DistributedInferenceSimulator`) | ⚠️ Partial | Queue-based `DisaggregatedSimulator` in `main.py` is the primary simulator |
 
 ## Based On
 
