@@ -2,3 +2,4 @@
 
 from distlmsim.analysis.memory_analysis import MemoryAnalyzer, MemoryBreakdown
 from distlmsim.analysis.mfu_analysis import MFUAnalyzer, MFUResult
+from distlmsim.analysis.timeline_analysis import TimelineAnalyzer, TraceEvent
