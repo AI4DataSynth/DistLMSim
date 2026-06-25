@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from distlmsim.config import ModelConfig
+from distlmsim.config import ModelConfig, DeviceSKUConfig
 
 
 @dataclass
@@ -31,6 +31,7 @@ class ExpertRoutingResult:
     gpu_loads: np.ndarray                # shape: [num_gpus] 每个 GPU 的 token 数
     max_gpu_load: int                    # 最大 GPU 负载
     load_imbalance: float                # 负载不均衡度 (std/mean)
+    per_expert_latencies: Optional[np.ndarray] = None  # shape: [num_experts] 每个专家的计算延迟 (ms)
 
 
 class ExpertParallelModel:
@@ -49,12 +50,14 @@ class ExpertParallelModel:
         ep_size: int,
         num_gpus_per_node: int = 8,
         redundant_experts: int = 0,
+        device_config: Optional[DeviceSKUConfig] = None,
     ):
         self._model = model_config
         self._ep_size = ep_size
         self._num_gpus_per_node = num_gpus_per_node
         self._redundant_experts = redundant_experts
         self._placement: List[ExpertPlacement] = []
+        self._device = device_config or DeviceSKUConfig()
 
     def create_expert_placement(
         self,
@@ -129,11 +132,16 @@ class ExpertParallelModel:
                 expert_id = top_k_indices[token_idx, k]
                 expert_loads[expert_id] += 1
 
+        # Per-expert 计算延迟 (Roofline 模型)
+        per_expert_latencies = self._compute_per_expert_latencies(expert_loads)
+
         # 计算 GPU 负载 (基于专家放置)
         gpu_loads = np.zeros(self._ep_size, dtype=np.int64)
+        gpu_latencies = np.zeros(self._ep_size, dtype=np.float64)
         for placement in self._placement:
             if placement.gpu_id < self._ep_size:
                 gpu_loads[placement.gpu_id] += expert_loads[placement.expert_id]
+                gpu_latencies[placement.gpu_id] += per_expert_latencies[placement.expert_id]
 
         max_gpu_load = int(np.max(gpu_loads))
         mean_load = np.mean(gpu_loads[gpu_loads > 0])
@@ -146,7 +154,45 @@ class ExpertParallelModel:
             gpu_loads=gpu_loads,
             max_gpu_load=max_gpu_load,
             load_imbalance=imbalance,
+            per_expert_latencies=per_expert_latencies,
         )
+
+    def _compute_per_expert_latencies(self, expert_loads: np.ndarray) -> np.ndarray:
+        """基于 Roofline 模型计算每个专家的计算延迟 (ms)。
+
+        Expert MLP: gate_up_proj + SiLU*up + down_proj
+        FLOPs = 2 * tokens * h * (2*expert_dim + expert_dim) = 6 * tokens * h * expert_dim
+        """
+        h = self._model.embedding_dim
+        expert_dim = (self._model.expert_intermediate_dim
+                      or int(h * 0.375))  # 默认 Qwen3-30B-A3B: 768
+        peak_flops = self._device.fp16_tflops * 1e12  # TFLOPS → FLOPS
+        mem_bw = self._device.memory_bandwidth_gbps * 1e9  # GB/s → B/s
+        eta_c, eta_m = 0.85, 0.90  # 效率因子
+
+        latencies = np.zeros(self._model.num_experts, dtype=np.float64)
+        for i in range(self._model.num_experts):
+            tokens_i = expert_loads[i]
+            if tokens_i == 0:
+                continue
+            # gate_up: [tokens, h] → [tokens, 2*expert_dim]
+            gate_up_flops = 2 * tokens_i * h * 2 * expert_dim
+            gate_up_mem = (tokens_i * h + 2 * tokens_i * expert_dim + h * 2 * expert_dim) * 2
+            # activation: SiLU + element-wise mul
+            act_flops = 2 * tokens_i * expert_dim
+            act_mem = 3 * tokens_i * expert_dim * 2
+            # down: [tokens, expert_dim] → [tokens, h]
+            down_flops = 2 * tokens_i * expert_dim * h
+            down_mem = (tokens_i * expert_dim + tokens_i * h + expert_dim * h) * 2
+
+            total_flops = gate_up_flops + act_flops + down_flops
+            total_mem = gate_up_mem + act_mem + down_mem
+
+            compute_ms = total_flops / (peak_flops * eta_c) * 1e3
+            memory_ms = total_mem / (mem_bw * eta_m) * 1e3
+            latencies[i] = max(compute_ms, memory_ms)
+
+        return latencies
 
     def get_alltoall_data_size(
         self,

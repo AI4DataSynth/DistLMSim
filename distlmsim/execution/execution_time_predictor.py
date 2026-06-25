@@ -104,8 +104,14 @@ class AnalyticalPredictor(ExecutionTimePredictor):
 
         # --- Attention (per layer) ---
         if is_prefill:
-            attn_flops = 4 * num_tokens * nq * num_tokens * hd
-            attn_mem = (3 * num_tokens * nq * hd + num_tokens * nq * hd) * bpe
+            # Chunked prefill: 新 chunk 需要 attend 到自身 + 之前积累的 KV cache
+            effective_kv_len = num_tokens + kv_cache_size
+            attn_flops = 4 * num_tokens * nq * effective_kv_len * hd
+            # 内存: 读取已有 KV cache + 新 Q/K/V + 输出
+            kv_read = 2 * batch_size * nkv * kv_cache_size * hd * bpe
+            qkv_new = (3 * num_tokens * nq * hd) * bpe
+            out_write = num_tokens * nq * hd * bpe
+            attn_mem = kv_read + qkv_new + out_write
         else:
             attn_flops = 4 * batch_size * nq * kv_cache_size * hd
             # KV cache 读取: 2 * batch * nkv * kv_len * hd
@@ -143,6 +149,25 @@ class AnalyticalPredictor(ExecutionTimePredictor):
         kv_save_bytes = 2 * batch_size * nkv * hd * bpe  # K + V 写入
         kv_save_time = kv_save_bytes / mem_bw * 1e3
 
+        # --- MoE Expert MLP (per layer, 均衡负载下最慢专家的时间) ---
+        expert_mlp_time = 0.0
+        if m.num_experts > 0:
+            expert_hidden = m.expert_intermediate_dim or int(h * 0.375)
+            tokens_per_expert_avg = num_tokens * m.top_k_experts / m.num_experts
+            # gate_up: h → expert_hidden (SwiGLU 风格，gate + up 合并)
+            exp_gate_up_flops = 2 * tokens_per_expert_avg * (h * expert_hidden * 2)
+            exp_gate_up_mem = (h * expert_hidden * 2 + tokens_per_expert_avg * h
+                               + tokens_per_expert_avg * expert_hidden * 2) * bpe
+            exp_gate_up_time = self._roofline_time_ms(exp_gate_up_flops, exp_gate_up_mem)
+            # down: expert_hidden → h
+            exp_down_flops = 2 * tokens_per_expert_avg * expert_hidden * h
+            exp_down_mem = (expert_hidden * h + tokens_per_expert_avg * expert_hidden
+                            + tokens_per_expert_avg * h) * bpe
+            exp_down_time = self._roofline_time_ms(exp_down_flops, exp_down_mem)
+            # 专家激活
+            exp_act_time = tokens_per_expert_avg * expert_hidden * bpe / mem_bw * 1e3
+            expert_mlp_time = exp_gate_up_time + exp_act_time + exp_down_time
+
         return ExecutionTime(
             attn_pre_proj_time=qkv_time * 0.5,
             attn_rope_time=rope_time,
@@ -156,6 +181,7 @@ class AnalyticalPredictor(ExecutionTimePredictor):
             input_layernorm_time=norm_time,
             post_attention_layernorm_time=norm_time,
             add_time=add_time,
+            expert_mlp_time=expert_mlp_time,
         )
 
 
@@ -163,15 +189,129 @@ class RandomForestPredictor(ExecutionTimePredictor):
     """RandomForest 预测器。
 
     从 profiling CSV 数据训练 RandomForest 模型。
-    复用 TRADIOS 的训练和缓存机制。
+    使用 sklearn RandomForestRegressor 进行特征工程和训练。
 
-    TODO: 实现从 TRADIOS 移植的 RF 训练逻辑。
+    特征工程：
+    - Attention: [num_tokens, batch_size, kv_cache_size, is_prefill]
+    - MLP: [num_tokens]
+
+    训练数据来自 TRADIOS 格式的 CSV 文件。
     """
 
-    def __init__(self, model_config: ModelConfig, device_config: DeviceSKUConfig):
+    def __init__(self, model_config: ModelConfig, device_config: DeviceSKUConfig, profiling_dir: str):
+        from sklearn.ensemble import RandomForestRegressor
+        
         self._model = model_config
         self._device = device_config
+        self._profiling_dir = profiling_dir
         self._fallback = AnalyticalPredictor(model_config, device_config)
+        
+        # 模型字典：name -> RandomForestRegressor
+        self._attn_models: Dict[str, RandomForestRegressor] = {}
+        self._mlp_models: Dict[str, RandomForestRegressor] = {}
+        
+        # 训练模型
+        self._train_attention_models()
+        self._train_mlp_models()
+        
+        logger.info("RandomForestPredictor 训练完成: %d attention 子模型, %d MLP 子模型",
+                    len(self._attn_models), len(self._mlp_models))
+
+    def _csv_path(self, *relative_parts: str) -> str:
+        """拼接 CSV 路径。"""
+        return os.path.join(self._profiling_dir, *relative_parts)
+
+    def _load_csv(self, path: str) -> Optional[object]:
+        """安全加载 CSV 文件，返回 pandas DataFrame 或 None。"""
+        if not os.path.isfile(path):
+            logger.warning("Profiling CSV 不存在: %s", path)
+            return None
+        try:
+            import pandas as pd
+            return pd.read_csv(path)
+        except Exception as e:
+            logger.warning("加载 CSV 失败 %s: %s", path, e)
+            return None
+
+    def _train_attention_models(self) -> None:
+        """从 attention.csv 训练 attention 子模型。"""
+        from sklearn.ensemble import RandomForestRegressor
+        
+        path = self._csv_path("attention.csv")
+        df = self._load_csv(path)
+        if df is None:
+            return
+
+        # attn_prefill: 特征 = [num_tokens] (仅 is_prefill==1 行)
+        target = "time_stats.attn_prefill.median"
+        if target in df.columns and "num_tokens" in df.columns:
+            mask = df["is_prefill"] == True if "is_prefill" in df.columns else slice(None)
+            subset = df.loc[mask] if "is_prefill" in df.columns else df
+            if len(subset) > 0:
+                X = subset[["num_tokens"]].values.astype(float)
+                y = subset[target].values.astype(float)
+                model = RandomForestRegressor(n_estimators=50, max_depth=10, random_state=42)
+                model.fit(X, y)
+                self._attn_models["attn_prefill"] = model
+                logger.debug("训练 attn_prefill RF 模型: %d 样本", len(X))
+
+        # attn_decode: 特征 = [batch_size] (仅 is_prefill==0 行)
+        target = "time_stats.attn_decode.median"
+        if target in df.columns and "batch_size" in df.columns:
+            mask = df["is_prefill"] == False if "is_prefill" in df.columns else slice(None)
+            subset = df.loc[mask] if "is_prefill" in df.columns else df
+            if len(subset) > 0:
+                X = subset[["batch_size"]].values.astype(float)
+                y = subset[target].values.astype(float)
+                model = RandomForestRegressor(n_estimators=50, max_depth=10, random_state=42)
+                model.fit(X, y)
+                self._attn_models["attn_decode"] = model
+                logger.debug("训练 attn_decode RF 模型: %d 样本", len(X))
+
+        # attn_kv_cache_save: 特征 = [kv_cache_size]
+        target = "time_stats.attn_kv_cache_save.median"
+        if target in df.columns and "kv_cache_size" in df.columns:
+            X = df[["kv_cache_size"]].values.astype(float)
+            y = df[target].values.astype(float)
+            model = RandomForestRegressor(n_estimators=50, max_depth=10, random_state=42)
+            model.fit(X, y)
+            self._attn_models["attn_kv_cache_save"] = model
+            logger.debug("训练 attn_kv_cache_save RF 模型: %d 样本", len(X))
+
+    def _train_mlp_models(self) -> None:
+        """从 mlp.csv 训练各子模型的 RandomForest。"""
+        from sklearn.ensemble import RandomForestRegressor
+        
+        path = self._csv_path("mlp.csv")
+        df = self._load_csv(path)
+        if df is None:
+            return
+        feature_col = "num_tokens"
+        if feature_col not in df.columns:
+            logger.warning("mlp.csv 缺少列 %s", feature_col)
+            return
+        
+        mlp_targets = {
+            "emb": "time_stats.emb.median",
+            "input_layernorm": "time_stats.input_layernorm.median",
+            "attn_pre_proj": "time_stats.attn_pre_proj.median",
+            "attn_rope": "time_stats.attn_rope.median",
+            "attn_post_proj": "time_stats.attn_post_proj.median",
+            "post_attention_layernorm": "time_stats.post_attention_layernorm.median",
+            "mlp_up_proj": "time_stats.mlp_up_proj.median",
+            "mlp_act": "time_stats.mlp_act.median",
+            "mlp_down_proj": "time_stats.mlp_down_proj.median",
+            "add": "time_stats.add.median",
+        }
+        
+        X = df[[feature_col]].values.astype(float)
+        for name, target_col in mlp_targets.items():
+            if target_col in df.columns:
+                y = df[target_col].values.astype(float)
+                model = RandomForestRegressor(n_estimators=50, max_depth=10, random_state=42)
+                model.fit(X, y)
+                self._mlp_models[name] = model
+                logger.debug("训练 MLP 子模型 %s RF: %d 样本", name, len(X))
 
     def get_execution_time(
         self,
@@ -180,10 +320,52 @@ class RandomForestPredictor(ExecutionTimePredictor):
         kv_cache_size: int,
         is_prefill: bool,
     ) -> ExecutionTime:
-        # TODO: 实现 RF 预测，当前回退到解析模型
-        return self._fallback.get_execution_time(
-            num_tokens, batch_size, kv_cache_size, is_prefill
-        )
+        """使用 RF 模型预测执行时间。"""
+        result = ExecutionTime()
+        
+        # Attention 预测
+        if is_prefill and "attn_prefill" in self._attn_models:
+            X = np.array([[num_tokens]], dtype=float)
+            result.attn_prefill_time = float(self._attn_models["attn_prefill"].predict(X)[0])
+        
+        if not is_prefill and "attn_decode" in self._attn_models:
+            X = np.array([[batch_size]], dtype=float)
+            result.attn_decode_time = float(self._attn_models["attn_decode"].predict(X)[0])
+        
+        if "attn_kv_cache_save" in self._attn_models:
+            X = np.array([[kv_cache_size]], dtype=float)
+            result.attn_kv_cache_save_time = float(self._attn_models["attn_kv_cache_save"].predict(X)[0])
+        
+        # MLP 预测
+        X = np.array([[num_tokens]], dtype=float)
+        for name, model in self._mlp_models.items():
+            pred = float(model.predict(X)[0])
+            if name == "emb":
+                result.emb_time = pred
+            elif name == "input_layernorm":
+                result.input_layernorm_time = pred
+            elif name == "attn_pre_proj":
+                result.attn_pre_proj_time = pred
+            elif name == "attn_rope":
+                result.attn_rope_time = pred
+            elif name == "attn_post_proj":
+                result.attn_post_proj_time = pred
+            elif name == "post_attention_layernorm":
+                result.post_attention_layernorm_time = pred
+            elif name == "mlp_up_proj":
+                result.mlp_up_proj_time = pred
+            elif name == "mlp_act":
+                result.mlp_act_time = pred
+            elif name == "mlp_down_proj":
+                result.mlp_down_proj_time = pred
+            elif name == "add":
+                result.add_time = pred
+        
+        # 如果 RF 模型未覆盖所有子模型，使用 fallback
+        if result.total_time == 0.0:
+            return self._fallback.get_execution_time(num_tokens, batch_size, kv_cache_size, is_prefill)
+        
+        return result
 
 
 class ProfilingBasedPredictor(ExecutionTimePredictor):
@@ -293,6 +475,8 @@ class ProfilingBasedPredictor(ExecutionTimePredictor):
         对 decode: 使用 batch_size 作为特征
         对 kv_cache_save: 使用 kv_cache_size 作为特征
         """
+        import pandas as pd
+
         path = self._csv_path("attention.csv")
         df = self._load_csv(path)
         if df is None:
@@ -302,7 +486,7 @@ class ProfilingBasedPredictor(ExecutionTimePredictor):
         target = "time_stats.attn_prefill.median"
         if target in df.columns and "num_tokens" in df.columns:
             mask = df["is_prefill"] == 1 if "is_prefill" in df.columns else slice(None)
-            subset = df.loc[mask] if isinstance(mask, object) else df
+            subset = df.loc[mask] if isinstance(mask, pd.Series) else df
             if len(subset) > 0:
                 x = subset["num_tokens"].values.astype(float)
                 y = subset[target].values.astype(float)
@@ -312,7 +496,7 @@ class ProfilingBasedPredictor(ExecutionTimePredictor):
         target = "time_stats.attn_decode.median"
         if target in df.columns and "batch_size" in df.columns:
             mask = df["is_prefill"] == 0 if "is_prefill" in df.columns else slice(None)
-            subset = df.loc[mask] if isinstance(mask, object) else df
+            subset = df.loc[mask] if isinstance(mask, pd.Series) else df
             if len(subset) > 0:
                 x = subset["batch_size"].values.astype(float)
                 y = subset[target].values.astype(float)
@@ -436,33 +620,54 @@ def create_predictor(
     model_config: ModelConfig,
     device_config: DeviceSKUConfig,
     profiling_dir: Optional[str] = None,
+    predictor_type: str = "auto",
 ) -> ExecutionTimePredictor:
     """工厂函数：创建执行时间预测器。
-
-    如果 profiling_dir 存在且包含 CSV 文件，返回 ProfilingBasedPredictor；
-    否则返回 AnalyticalPredictor。
 
     Args:
         model_config: 模型配置
         device_config: 设备配置
         profiling_dir: profiling 数据目录路径（可选）
+        predictor_type: 预测器类型 ("auto", "analytical", "profiled", "random_forest")
+            - "auto": 根据 profiling_dir 自动选择（默认）
+            - "analytical": 强制使用 AnalyticalPredictor
+            - "profiled": 强制使用 ProfilingBasedPredictor（需要 profiling_dir）
+            - "random_forest": 强制使用 RandomForestPredictor（需要 profiling_dir）
 
     Returns:
         ExecutionTimePredictor 实例
     """
+    # 检查 profiling 目录
+    has_csv = False
     if profiling_dir is not None and os.path.isdir(profiling_dir):
-        # 检查是否至少有一个 CSV 文件
-        has_csv = False
         for root, _dirs, files in os.walk(profiling_dir):
             if any(f.endswith(".csv") for f in files):
                 has_csv = True
                 break
+
+    # 根据类型选择预测器
+    if predictor_type == "analytical":
+        logger.info("使用 AnalyticalPredictor（强制）")
+        return AnalyticalPredictor(model_config, device_config)
+    
+    elif predictor_type == "profiled":
+        if not has_csv:
+            logger.warning("请求 ProfilingBasedPredictor 但 profiling 目录无效，回退到 AnalyticalPredictor")
+            return AnalyticalPredictor(model_config, device_config)
+        logger.info("使用 ProfilingBasedPredictor，数据目录: %s", profiling_dir)
+        return ProfilingBasedPredictor(model_config, device_config, profiling_dir)
+    
+    elif predictor_type == "random_forest":
+        if not has_csv:
+            logger.warning("请求 RandomForestPredictor 但 profiling 目录无效，回退到 AnalyticalPredictor")
+            return AnalyticalPredictor(model_config, device_config)
+        logger.info("使用 RandomForestPredictor，数据目录: %s", profiling_dir)
+        return RandomForestPredictor(model_config, device_config, profiling_dir)
+    
+    else:  # auto
         if has_csv:
-            logger.info("使用 ProfilingBasedPredictor，数据目录: %s", profiling_dir)
+            logger.info("自动选择 ProfilingBasedPredictor，数据目录: %s", profiling_dir)
             return ProfilingBasedPredictor(model_config, device_config, profiling_dir)
         else:
-            logger.info("profiling 目录无 CSV 文件，回退到 AnalyticalPredictor")
-    else:
-        logger.info("未提供 profiling 目录，使用 AnalyticalPredictor")
-
-    return AnalyticalPredictor(model_config, device_config)
+            logger.info("未提供有效 profiling 目录，使用 AnalyticalPredictor")
+            return AnalyticalPredictor(model_config, device_config)

@@ -287,6 +287,68 @@ def main():
             avg.num_requests = int(np.mean([r.num_requests for r in rs]))
             averaged.append(avg)
         print_table(averaged, title=f"多种子平均 ({len(seeds)} seeds)")
+        plot_scheduling_results(averaged)
+
+
+def plot_scheduling_results(results):
+    """生成调度策略对比图表并保存。"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from pathlib import Path
+
+    names = [r.scheduler_name for r in results]
+    ttft_p50 = [r.ttft_p50 for r in results]
+    e2e_p50 = [r.e2e_p50 for r in results]
+    tail_ratio = [r.ttft_tail_ratio for r in results]
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+
+    # TTFT P50
+    ax = axes[0, 0]
+    colors = ["#2ecc71" if r.scheduler_key == "sjf" else "#3498db" for r in results]
+    ax.barh(names, ttft_p50, color=colors)
+    ax.set_xlabel("TTFT P50 (ms)")
+    ax.set_title("TTFT P50 by Scheduler")
+    ax.set_xscale("log")
+
+    # Tail Ratio
+    ax = axes[0, 1]
+    ax.barh(names, tail_ratio, color=colors)
+    ax.axvline(x=10, color="red", linestyle="--", alpha=0.5, label="Threshold (10x)")
+    ax.set_xlabel("Tail Latency Ratio (P99/P50)")
+    ax.set_title("TTFT Tail Latency Ratio")
+    ax.legend()
+
+    # Trade-off scatter
+    ax = axes[1, 0]
+    for r in results:
+        marker = "o" if r.scheduler_key not in ("sjf", "po") else "*"
+        color = "#2ecc71" if r.scheduler_key == "po" else ("#e74c3c" if r.scheduler_key == "sjf" else "#3498db")
+        ax.scatter(r.ttft_mean, r.e2e_mean, s=100, marker=marker, c=color, zorder=5)
+        ax.annotate(r.scheduler_key.upper(), (r.ttft_mean, r.e2e_mean), fontsize=8, ha="left")
+    ax.set_xlabel("TTFT Mean (ms)")
+    ax.set_ylabel("E2E Mean (ms)")
+    ax.set_title("Trade-off: TTFT Mean vs E2E Mean")
+
+    # Composite score
+    ax = axes[1, 1]
+    scores = []
+    for r in results:
+        score = 1.0 / (1 + r.ttft_p50 / 1000) * 0.4 + 1.0 / (1 + r.ttft_tail_ratio / 10) * 0.6
+        scores.append(score)
+    best_idx = scores.index(max(scores))
+    colors2 = ["#2ecc71" if i == best_idx else "#95a5a6" for i in range(len(results))]
+    ax.barh(names, scores, color=colors2)
+    ax.set_xlabel("Composite Score")
+    ax.set_title(f"Composite Scheduler Score (Best: {results[best_idx].scheduler_key.upper()})")
+
+    plt.tight_layout()
+    out_dir = Path("results")
+    out_dir.mkdir(exist_ok=True)
+    plt.savefig(out_dir / "scheduling_comparison.png", dpi=300, bbox_inches="tight")
+    plt.savefig(out_dir / "scheduling_comparison.pdf", bbox_inches="tight")
+    print(f"\n图表已保存: {out_dir / 'scheduling_comparison.pdf'}")
 
 
 if __name__ == "__main__":

@@ -25,8 +25,9 @@ class RDMAModel:
     2. Profiling 模型: 从预采集数据查表
     """
 
-    def __init__(self, config: RDMAConfig):
+    def __init__(self, config: RDMAConfig, congestion_alpha: float = 0.05):
         self._config = config
+        self._congestion_alpha = congestion_alpha
 
     def get_transfer_time(
         self,
@@ -34,6 +35,7 @@ class RDMAModel:
         src_node_id: int = 0,
         dst_node_id: int = 1,
         use_profiling: bool = False,
+        concurrent_transfers: int = 1,
     ) -> float:
         """计算节点间 RDMA 数据传输时间 (ms)。
 
@@ -42,21 +44,22 @@ class RDMAModel:
             src_node_id: 源节点 ID
             dst_node_id: 目标节点 ID
             use_profiling: 是否使用 profiling 数据
+            concurrent_transfers: 同时进行的传输流数量 (用于拥塞建模)
 
         Returns:
             传输时间 (ms)
         """
         if use_profiling:
             return self._get_transfer_from_profiling(data_size_bytes)
-        return self._get_transfer_analytical(data_size_bytes)
+        return self._get_transfer_analytical(data_size_bytes, concurrent_transfers)
 
-    def _get_transfer_analytical(self, data_size_bytes: int) -> float:
+    def _get_transfer_analytical(self, data_size_bytes: int, concurrent_transfers: int = 1) -> float:
         """解析模型计算 RDMA 传输时间。
 
         模型: T = latency + data_size / effective_bandwidth
         考虑:
         - 协议开销 (RoCEv2 header, IB header)
-        - 拥塞控制 (DCQCN 降速因子)
+        - 拥塞控制 (DCQCN 降速因子，基于并发流数量)
         - MTU 分片
         """
         # 基础延迟
@@ -66,8 +69,8 @@ class RDMAModel:
         protocol_overhead = self._get_protocol_overhead_ratio()
         effective_bw_gbps = self._config.bandwidth_gbps * (1 - protocol_overhead)
 
-        # 拥塞控制降速 (RoCEv2 DCQCN 在多流竞争时降速)
-        congestion_factor = self._get_congestion_factor()
+        # 拥塞控制降速 (基于并发传输数量)
+        congestion_factor = self._get_congestion_factor(concurrent_transfers)
         effective_bw_gbps *= congestion_factor
 
         effective_bw_Bps = effective_bw_gbps * 1e9 / 8
@@ -89,13 +92,24 @@ class RDMAModel:
             # TCP/IP: 开销较大
             return 0.10
 
-    def _get_congestion_factor(self) -> float:
+    def _get_congestion_factor(self, concurrent_transfers: int = 1) -> float:
         """拥塞控制降速因子 (0-1, 1=无拥塞)。
 
-        TODO: 基于网络拓扑中的并发流数量动态计算。
-        当前简单返回 1.0 (无拥塞)。
+        基于 alpha-fair 拥塞模型:
+        factor = 1 / (1 + alpha * max(0, concurrent - 1))
+        
+        当多流共享同一 RDMA 链路时，DCQCN 拥塞控制会降低每流的有效带宽。
+        alpha 参数控制拥塞敏感度 (默认 0.05，即每增加一个并发流带宽降低约 5%)。
+
+        Args:
+            concurrent_transfers: 同时进行的传输流数量
+
+        Returns:
+            带宽衰减因子 (0-1)
         """
-        return 1.0
+        if concurrent_transfers <= 1:
+            return 1.0
+        return 1.0 / (1.0 + self._congestion_alpha * (concurrent_transfers - 1))
 
     def _get_transfer_from_profiling(self, data_size_bytes: int) -> float:
         """从 profiling 数据查询传输时间。

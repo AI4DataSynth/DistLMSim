@@ -28,9 +28,15 @@ from distlmsim.config import (
     MetricsConfig,
 )
 from distlmsim.entities import Request, RequestStatus, ExecutionTime
-from distlmsim.execution.execution_time_predictor import AnalyticalPredictor
+from distlmsim.execution.execution_time_predictor import (
+    AnalyticalPredictor,
+    ExecutionTimePredictor,
+    create_predictor,
+)
 from distlmsim.topology.nvlink_model import NVLinkModel
 from distlmsim.topology.rdma_model import RDMAModel
+from distlmsim.topology.overlap_processor import OverlapProcessor, OverlapConfig
+from distlmsim.parallelism.expert_parallel import ExpertParallelModel
 from distlmsim.metrics.metrics_store import MetricsStore
 from distlmsim.scheduling.advanced_schedulers import AdvancedSchedulers
 
@@ -49,8 +55,10 @@ class SimContext:
     # 通信模型
     nvlink_model: NVLinkModel = field(default=None)
     rdma_model: RDMAModel = field(default=None)
+    # 通信-计算重叠模型 (论文 §3.6: 3D Timeline)
+    overlap_processor: OverlapProcessor = field(default=None)
     # 执行时间预测
-    time_predictor: AnalyticalPredictor = field(default=None)
+    time_predictor: ExecutionTimePredictor = field(default=None)
     # 请求池
     requests: Dict[int, Request] = field(default_factory=dict)
     # 指标
@@ -60,6 +68,9 @@ class SimContext:
     prefill_node_id: int = 0
     decode_node_id: int = 1
     tp_size: int = 4
+    # Profiling 配置
+    profiling_dir: Optional[str] = None
+    predictor_type: str = "auto"  # "auto", "analytical", "profiled", "random_forest"
 
     def __post_init__(self):
         if self.nvlink_model is None:
@@ -67,10 +78,16 @@ class SimContext:
                 self.network_config.nvlink, self.num_gpus_per_node
             )
         if self.rdma_model is None:
-            self.rdma_model = RDMAModel(self.network_config.rdma)
+            self.rdma_model = RDMAModel(
+                self.network_config.rdma,
+                congestion_alpha=self.network_config.rdma.congestion_alpha,
+            )
+        if self.overlap_processor is None:
+            self.overlap_processor = OverlapProcessor(OverlapConfig())
         if self.time_predictor is None:
-            self.time_predictor = AnalyticalPredictor(
-                self.model_config, self.device_config
+            self.time_predictor = create_predictor(
+                self.model_config, self.device_config,
+                self.profiling_dir, self.predictor_type
             )
 
 
@@ -118,6 +135,85 @@ class DisaggregatedSimulator:
         self._prefill_policy = prefill_schedule_policy
         self._decode_policy = decode_schedule_policy
         self._advanced_schedulers = AdvancedSchedulers(seed=config.seed)
+
+    def _compute_moe_imbalance_factor(self, num_tokens: int) -> float:
+        """计算 MoE 专家负载不均衡因子。
+
+        使用 Zipf 分布模拟 token→expert 路由，返回 max_gpu_load / avg_gpu_load。
+        该因子用于调整 expert_mlp_time：有效专家时间 = expert_mlp_time × imbalance_factor。
+
+        论文 §3.5: "最慢专家决定 all-to-all 通信完成时间"
+
+        Args:
+            num_tokens: 当前 batch 的总 token 数
+
+        Returns:
+            不均衡因子 (≥ 1.0，1.0 表示完全均衡)
+        """
+        model = self.ctx.model_config
+        if model.num_experts <= 0:
+            return 1.0
+
+        alpha = self.config.disaggregated.moe_expert_load_zipf_alpha
+        num_experts = model.num_experts
+        top_k = model.top_k_experts
+
+        # 生成 Zipf 分布的专家路由权重
+        rng = self._rng
+        ranks = np.arange(1, num_experts + 1, dtype=float)
+        weights = 1.0 / (ranks ** alpha)
+        weights /= weights.sum()
+
+        # 模拟 token 路由: 每 token 选 top_k 专家
+        expert_loads = np.zeros(num_experts, dtype=np.int64)
+        for _ in range(num_tokens):
+            chosen = rng.choice(num_experts, size=top_k, replace=False, p=weights)
+            expert_loads[chosen] += 1
+
+        # 计算 GPU 负载 (假设均匀放置: 每 GPU 放 num_experts/ep_size 个专家)
+        ep_size = min(num_experts, self.ctx.tp_size)
+        experts_per_gpu = num_experts // ep_size
+        gpu_loads = np.zeros(ep_size, dtype=np.int64)
+        for gpu_id in range(ep_size):
+            start = gpu_id * experts_per_gpu
+            end = start + experts_per_gpu
+            gpu_loads[gpu_id] = expert_loads[start:end].sum()
+
+        # Per-expert latency (Roofline 模型)
+        ep_model = ExpertParallelModel(model, ep_size, device_config=self.ctx.device_config)
+        per_expert_latencies = ep_model._compute_per_expert_latencies(expert_loads)
+
+        # GPU 级延迟: 每 GPU 上所有专家延迟之和 (串行执行)
+        gpu_latencies = np.zeros(ep_size, dtype=np.float64)
+        for gpu_id in range(ep_size):
+            start = gpu_id * experts_per_gpu
+            end = start + experts_per_gpu
+            gpu_latencies[gpu_id] = per_expert_latencies[start:end].sum()
+
+        max_latency = float(gpu_latencies.max())
+        avg_latency = float(gpu_latencies[gpu_latencies > 0].mean())
+
+        if avg_latency <= 0:
+            return 1.0
+
+        return max_latency / avg_latency
+
+    def _apply_tp_overlap(self, compute_ms: float, comm_ms: float) -> float:
+        """应用通信-计算重叠模型，返回单层墙钟时间 (ms)。
+
+        论文 §3.6: 构建 3D timeline，计算和通信在不同硬件单元上并发执行。
+        重叠部分双方因资源竞争而变慢 (compute_slowdown=1.15, comm_slowdown=1.20)。
+        墙钟时间 = max(adjusted_compute, adjusted_comm)。
+
+        当 comm_ms == 0 (TP=1) 时，退化为纯计算时间。
+        """
+        if comm_ms <= 0:
+            return compute_ms
+
+        proc = self.ctx.overlap_processor
+        pair = proc.make_compute_comm_pair(compute_ms, comm_ms)
+        pair = proc.apply_ratio_slowdown(pair)
+        return max(pair.adjusted_a_ms, pair.adjusted_b_ms)
 
     def _create_request(self, arrival_time: float) -> Request:
         """创建一个合成请求。"""
@@ -182,22 +278,82 @@ class DisaggregatedSimulator:
     def _compute_prefill_time(self, batch_requests: List[Request]) -> float:
         """计算一个 prefill batch 的执行时间 (ms)。
 
-        时间 = sum(每层计算时间 + 每层 TP 通信时间) * num_layers
+        支持 chunked prefill (论文 §3.4): 当 enable_chunked_prefill=True 时，
+        将每个请求的 prefill tokens 拆分为多个 chunk 顺序处理，
+        每个 chunk 的 attention 需要 attend 到之前积累的 KV cache。
+        这降低了峰值内存但增加了 prefill 延迟。
+
+        时间 = sum(每 chunk 的 [每层计算时间 + 每层 TP 通信时间]) * num_layers
+        """
+        chunk_times = self._compute_prefill_time_per_chunk(batch_requests)
+        return sum(chunk_times)
+
+    def _compute_prefill_time_per_chunk(self, batch_requests: List[Request]) -> List[float]:
+        """计算每个 prefill chunk 的执行时间列表 (ms)。
+
+        返回每个 chunk 的执行时间，用于 PIPELINED 传输策略的重叠计算。
         """
         total_tokens = sum(r.prefill_tokens for r in batch_requests)
         batch_size = len(batch_requests)
         model = self.ctx.model_config
 
+        # Chunked prefill 配置
+        dcfg = self.config.disaggregated
+        if dcfg.enable_chunked_prefill and dcfg.prefill_chunk_size > 0:
+            chunk_size = dcfg.prefill_chunk_size
+        else:
+            chunk_size = total_tokens  # 不拆分
+
+        if total_tokens <= chunk_size:
+            # 无需拆分，单次处理
+            return [self._compute_prefill_chunk(
+                batch_requests, total_tokens, batch_size, kv_cache_size=0
+            )]
+
+        # 拆分: 按 chunk_size 逐步处理，KV cache 逐步积累
+        chunk_times = []
+        processed_tokens = 0
+        while processed_tokens < total_tokens:
+            this_chunk = min(chunk_size, total_tokens - processed_tokens)
+            chunk_time = self._compute_prefill_chunk(
+                batch_requests, this_chunk, batch_size, kv_cache_size=processed_tokens
+            )
+            chunk_times.append(chunk_time)
+            processed_tokens += this_chunk
+
+        return chunk_times
+
+    def _compute_prefill_chunk(
+        self,
+        batch_requests: List[Request],
+        num_tokens: int,
+        batch_size: int,
+        kv_cache_size: int,
+    ) -> float:
+        """计算单个 prefill chunk 的执行时间 (一层的时间，不含 ×num_layers)。
+
+        Args:
+            kv_cache_size: 之前 chunk 积累的 KV cache 长度 (tokens)
+        """
+        model = self.ctx.model_config
+
         exec_time = self.ctx.time_predictor.get_execution_time(
-            num_tokens=total_tokens,
+            num_tokens=num_tokens,
             batch_size=batch_size,
-            kv_cache_size=0,
+            kv_cache_size=kv_cache_size,
             is_prefill=True,
         )
 
-        per_layer_time = exec_time.total_time
-        tp_comm = self._compute_tp_allreduce_time(total_tokens)
-        total_per_layer = per_layer_time + tp_comm
+        # MoE 负载不均衡调整: expert_mlp_time × (max_load / avg_load)
+        if exec_time.expert_mlp_time > 0:
+            imbalance_factor = self._compute_moe_imbalance_factor(num_tokens)
+            adjusted_total = exec_time.total_time + exec_time.expert_mlp_time * (imbalance_factor - 1.0)
+        else:
+            adjusted_total = exec_time.total_time
+
+        per_layer_time = adjusted_total
+        tp_comm = self._compute_tp_allreduce_time(num_tokens)
+        total_per_layer = self._apply_tp_overlap(per_layer_time, tp_comm)
 
         return total_per_layer * model.num_layers
 
@@ -205,6 +361,8 @@ class DisaggregatedSimulator:
         """计算一步 decode 的执行时间 (ms)。
 
         Decode 每步生成 1 个 token per request。
+        MoE 负载不均衡通过 _compute_moe_imbalance_factor() 调整 expert_mlp_time。
+        通信-计算重叠通过 _apply_tp_overlap() 建模 (论文 §3.6)。
         """
         batch_size = len(batch_requests)
         num_tokens = batch_size  # 每请求 1 token
@@ -219,15 +377,171 @@ class DisaggregatedSimulator:
             is_prefill=False,
         )
 
-        per_layer_time = exec_time.total_time
+        # MoE 负载不均衡调整: expert_mlp_time × (max_load / avg_load)
+        if exec_time.expert_mlp_time > 0:
+            imbalance_factor = self._compute_moe_imbalance_factor(num_tokens)
+            adjusted_total = exec_time.total_time + exec_time.expert_mlp_time * (imbalance_factor - 1.0)
+        else:
+            adjusted_total = exec_time.total_time
+
+        per_layer_time = adjusted_total
         tp_comm = self._compute_tp_allreduce_time(num_tokens)
-        total_per_layer = per_layer_time + tp_comm
+        total_per_layer = self._apply_tp_overlap(per_layer_time, tp_comm)
 
         return total_per_layer * model.num_layers
 
-    def _compute_kv_transfer_time(self, kv_cache_bytes: int) -> float:
-        """计算 KV Cache RDMA 传输时间 (ms)。"""
-        return self.ctx.rdma_model.get_transfer_time(kv_cache_bytes)
+    # ─── Speculative Decoding (委托给 SpeculativeDecoder 模块) ──────────────
+
+    def _get_spec_decoder(self) -> "SpeculativeDecoder":
+        """懒初始化 SpeculativeDecoder。"""
+        if not hasattr(self, '_spec_decoder') or self._spec_decoder is None:
+            from distlmsim.execution.speculative_decoder import SpeculativeDecoder
+            self._spec_decoder = SpeculativeDecoder(
+                self.ctx, self.config.disaggregated, self._rng
+            )
+        return self._spec_decoder
+
+    def _compute_dynamic_batch_sizes(self) -> tuple:
+        """基于 GPU 显存容量动态计算 prefill 和 decode 的最大 batch size。
+
+        Returns:
+            (prefill_bs, decode_bs): 受 GPU 显存约束的实际 batch size
+        """
+        model = self.ctx.model_config
+        device = self.ctx.device_config
+        dcfg = self.config.disaggregated
+        num_gpus = self.ctx.tp_size
+
+        # 模型参数大小 (GB): 近似 active 参数量 × 2 bytes (FP16)
+        if model.num_experts > 0:
+            active_params = (model.num_layers * model.embedding_dim *
+                             (4 * model.embedding_dim) * 2)
+        else:
+            active_params = model.num_layers * model.embedding_dim * (4 * model.embedding_dim) * 2
+        model_size_gb = active_params / 1e9 / num_gpus
+
+        total_gpu_mem_gb = device.memory_gb
+        available_mem_gb = total_gpu_mem_gb * dcfg.gpu_memory_utilization - model_size_gb
+
+        if available_mem_gb <= 0:
+            logger.warning("GPU 显存不足! model=%.1fGB, avail=%.1fGB", model_size_gb, available_mem_gb)
+            return 1, 1
+
+        head_dim = model.embedding_dim // model.num_q_heads
+        # KV cache per request: 2(K+V) × layers × kv_heads × head_dim × avg_seq_len × 2(FP16)
+        avg_seq_len = 512 + 128
+        kv_per_req_bytes = 2 * model.num_layers * model.num_kv_heads * head_dim * avg_seq_len * 2
+
+        avg_prefill_tokens = self.config.request.prefill_length
+        kv_per_prefill_req = 2 * model.num_layers * model.num_kv_heads * head_dim * avg_prefill_tokens * 2
+
+        max_prefill_bs = max(1, int(available_mem_gb * 1e9 / max(1, kv_per_prefill_req)))
+        max_decode_bs = max(1, int(available_mem_gb * 1e9 / max(1, kv_per_req_bytes)))
+
+        prefill_bs = min(dcfg.prefill_batch_size, max_prefill_bs)
+        decode_bs = min(dcfg.decode_batch_size, max_decode_bs)
+
+        logger.info("动态 batch size: prefill=%d (max=%d), decode=%d (max=%d) "
+                     "[model=%.1fGB, avail=%.1fGB, kv/req=%.1fMB]",
+                     prefill_bs, max_prefill_bs, decode_bs, max_decode_bs,
+                     model_size_gb, available_mem_gb, kv_per_req_bytes / 1e6)
+        return prefill_bs, decode_bs
+
+    def _compute_kv_transfer_time(self, kv_cache_bytes: int, concurrent_transfers: int = 1) -> float:
+        """计算 KV Cache 传输时间 (ms)，根据策略选择传输方式。
+
+        Args:
+            kv_cache_bytes: KV Cache 数据量 (bytes)
+            concurrent_transfers: 同时进行的传输流数量 (用于拥塞建模)
+        """
+        from distlmsim.types import KVCacheTransferStrategy
+        strategy = self.config.disaggregated.kv_cache_transfer_strategy
+
+        if strategy == KVCacheTransferStrategy.DIRECT:
+            return self.ctx.rdma_model.get_transfer_time(
+                kv_cache_bytes, concurrent_transfers=concurrent_transfers
+            )
+        elif strategy == KVCacheTransferStrategy.STORE_FORWARD:
+            return self._compute_store_forward_time(kv_cache_bytes)
+        else:
+            # PIPELINED 不在此处计算，在 run() 中按 chunk 处理
+            return self.ctx.rdma_model.get_transfer_time(
+                kv_cache_bytes, concurrent_transfers=concurrent_transfers
+            )
+
+    def _compute_store_forward_time(self, kv_cache_bytes: int) -> float:
+        """计算 Store-and-Forward 传输时间 (ms)。
+
+        流程: prefill 节点写入中间存储 → decode 节点从中间存储读取
+        时间 = write_time + storage_latency + read_time
+        """
+        dcfg = self.config.disaggregated
+        write_bw = dcfg.store_forward_write_bw_gbps * 1e9 / 8  # GB/s → B/s
+        read_bw = dcfg.store_forward_read_bw_gbps * 1e9 / 8
+        latency_ms = dcfg.store_forward_latency_us / 1000.0
+
+        write_time = kv_cache_bytes / write_bw * 1000  # ms
+        read_time = kv_cache_bytes / read_bw * 1000
+
+        return write_time + latency_ms + read_time
+
+    def _compute_pipelined_kv_ready_time(
+        self,
+        batch_requests: List[Request],
+        prefill_start: float,
+    ) -> float:
+        """计算 PIPELINED 策略下 KV Cache 就绪时间。
+
+        在 chunked prefill 中，每个 chunk 完成后立即开始传输该 chunk 的 KV cache，
+        传输与下一个 chunk 的计算重叠。最终就绪时间取决于最后一个 chunk 的传输完成。
+
+        Returns:
+            KV Cache 就绪时间 (ms, 绝对时间)
+        """
+        total_tokens = sum(r.prefill_tokens for r in batch_requests)
+        chunk_times = self._compute_prefill_time_per_chunk(batch_requests)
+        dcfg = self.config.disaggregated
+
+        if dcfg.enable_chunked_prefill and dcfg.prefill_chunk_size > 0:
+            chunk_size = dcfg.prefill_chunk_size
+        else:
+            chunk_size = total_tokens
+
+        # 按 chunk 逐步计算
+        compute_cursor = prefill_start  # 计算进度游标
+        transfer_end = prefill_start    # 传输完成时间
+        processed_tokens = 0
+
+        for chunk_time in chunk_times:
+            # 当前 chunk 的计算完成时间
+            compute_cursor += chunk_time
+            processed_tokens = min(processed_tokens + chunk_size, total_tokens)
+
+            # 当前 chunk 对应的 KV cache 大小
+            chunk_kv_bytes = sum(
+                self._compute_kv_cache_size_for_tokens(r, min(chunk_size, r.prefill_tokens - (processed_tokens - chunk_size)))
+                for r in batch_requests
+            )
+
+            # 传输可以在计算完成后立即开始
+            # batch 中所有请求同时传输该 chunk 的 KV cache
+            chunk_transfer_time = self.ctx.rdma_model.get_transfer_time(
+                max(1, chunk_kv_bytes),
+                concurrent_transfers=len(batch_requests),
+            )
+            chunk_transfer_end = compute_cursor + chunk_transfer_time
+
+            # 更新最晚传输完成时间
+            transfer_end = max(transfer_end, chunk_transfer_end)
+
+        return transfer_end
+
+    def _compute_kv_cache_size_for_tokens(self, request: Request, num_tokens: int) -> int:
+        """计算指定 token 数的 KV Cache 大小 (bytes)。"""
+        model = self.ctx.model_config
+        head_dim = model.embedding_dim // model.num_q_heads
+        kv_per_token = 2 * model.num_layers * model.num_kv_heads * head_dim * 2
+        return num_tokens * kv_per_token
 
     def _select_from_queue(
         self,
@@ -325,8 +639,8 @@ class DisaggregatedSimulator:
         logger.info(f"Prefill 调度策略: {self._prefill_policy}")
         logger.info(f"Decode 调度策略:  {self._decode_policy}")
 
-        prefill_bs = self.config.disaggregated.prefill_batch_size
-        decode_bs = self.config.disaggregated.decode_batch_size
+        # 动态 batch size: 基于 GPU 显存约束
+        prefill_bs, decode_bs = self._compute_dynamic_batch_sizes()
 
         # 记录到达信息
         for req in all_requests:
@@ -377,16 +691,35 @@ class DisaggregatedSimulator:
                 ms.record_prefill_start(req.id, prefill_start, self.ctx.prefill_node_id)
                 ms.record_prefill_end(req.id, prefill_end)
 
-            # ─── KV Cache 传输 (RDMA) ─────────────────────────────────────
-            for req in batch:
-                kv_size = self._compute_kv_cache_size(req)
-                req.kv_cache_size_bytes = kv_size
-                transfer_time = self._compute_kv_transfer_time(kv_size)
-                transfer_end = prefill_end + transfer_time
-                kv_ready_time[req.id] = transfer_end
-                req.status = RequestStatus.KV_CACHE_TRANSFERRING
-                ms.record_kv_cache_transfer_start(req.id, prefill_end)
-                ms.record_kv_cache_transfer_end(req.id, transfer_end)
+            # ─── KV Cache 传输 (根据策略) ─────────────────────────────────
+            from distlmsim.types import KVCacheTransferStrategy
+            strategy = self.config.disaggregated.kv_cache_transfer_strategy
+
+            if strategy == KVCacheTransferStrategy.PIPELINED:
+                # PIPELINED: chunked prefill 中边算边传
+                pipelined_end = self._compute_pipelined_kv_ready_time(batch, prefill_start)
+                for req in batch:
+                    kv_size = self._compute_kv_cache_size(req)
+                    req.kv_cache_size_bytes = kv_size
+                    kv_ready_time[req.id] = pipelined_end
+                    req.status = RequestStatus.KV_CACHE_TRANSFERRING
+                    ms.record_kv_cache_transfer_start(req.id, prefill_end)
+                    ms.record_kv_cache_transfer_end(req.id, pipelined_end)
+            else:
+                # DIRECT / STORE_FORWARD: prefill 完成后一次性传输
+                # 所有请求同时传输 KV cache，共享 RDMA 链路带宽
+                batch_size = len(batch)
+                for req in batch:
+                    kv_size = self._compute_kv_cache_size(req)
+                    req.kv_cache_size_bytes = kv_size
+                    transfer_time = self._compute_kv_transfer_time(
+                        kv_size, concurrent_transfers=batch_size
+                    )
+                    transfer_end = prefill_end + transfer_time
+                    kv_ready_time[req.id] = transfer_end
+                    req.status = RequestStatus.KV_CACHE_TRANSFERRING
+                    ms.record_kv_cache_transfer_start(req.id, prefill_end)
+                    ms.record_kv_cache_transfer_end(req.id, transfer_end)
 
             logger.debug(
                 f"Prefill batch: size={len(batch)}, "
@@ -435,26 +768,76 @@ class DisaggregatedSimulator:
             batch_ready = max(kv_ready_time[r.id] for r in decode_batch)
             current_time = max(decode_free_time, batch_ready)
 
+            # ─── Speculative Decoding 分支 ───────────────────────────────
+            spec_cfg = self.config.disaggregated
+            use_spec = spec_cfg.enable_speculative_decoding
+            K = spec_cfg.speculation_length if use_spec else 1
+            alpha = spec_cfg.acceptance_rate if use_spec else 1.0
+
             max_decode_len = max(r.decode_tokens for r in decode_batch)
-            for step in range(max_decode_len):
-                active = [r for r in decode_batch if r.num_generated_tokens < r.decode_tokens]
-                if not active:
-                    break
+            if use_spec:
+                # Speculative decoding: draft→verify 循环 (委托给 SpeculativeDecoder)
+                spec_decoder = self._get_spec_decoder()
+                while True:
+                    active = [r for r in decode_batch if r.num_generated_tokens < r.decode_tokens]
+                    if not active:
+                        break
 
-                step_time = self._compute_decode_step_time(active)
-                step_end = current_time + step_time
+                    min_remaining = min(r.decode_tokens - r.num_generated_tokens for r in active)
+                    effective_K = min(K, min_remaining)
 
-                for req in active:
-                    req.num_generated_tokens += 1
-                    if req.decode_start_time is None:
-                        req.decode_start_time = current_time
-                        ms.record_decode_start(req.id, current_time, self.ctx.decode_node_id)
-                    if req.num_generated_tokens >= req.decode_tokens:
-                        req.decode_end_time = step_end
-                        req.status = RequestStatus.COMPLETED
-                        ms.record_decode_end(req.id, step_end)
+                    if effective_K <= 0:
+                        break
 
-                current_time = step_end
+                    for req in active:
+                        if req.decode_start_time is None:
+                            req.decode_start_time = current_time
+                            ms.record_decode_start(req.id, current_time, self.ctx.decode_node_id)
+
+                    # Draft 阶段: K 步 decode
+                    draft_time = 0.0
+                    for _k in range(effective_K):
+                        draft_time += spec_decoder.compute_draft_step_time(active)
+
+                    # Verify 阶段: 1 次 forward pass
+                    verify_time = spec_decoder.compute_verify_time(active, effective_K)
+
+                    # 采样接受 token 数
+                    accepted = spec_decoder.sample_acceptance(effective_K, alpha)
+                    total_accepted = min(accepted + 1, effective_K)
+
+                    round_time = draft_time + verify_time
+                    step_end = current_time + round_time
+
+                    for req in active:
+                        req.num_generated_tokens += total_accepted
+                        if req.num_generated_tokens >= req.decode_tokens:
+                            req.decode_end_time = step_end
+                            req.status = RequestStatus.COMPLETED
+                            ms.record_decode_end(req.id, step_end)
+
+                    current_time = step_end
+            else:
+                # 标准 decode: 每步 1 token
+                for step in range(max_decode_len):
+                    active = [r for r in decode_batch if r.num_generated_tokens < r.decode_tokens]
+                    if not active:
+                        break
+
+                    step_time = self._compute_decode_step_time(active)
+                    step_end = current_time + step_time
+
+                    for req in active:
+                        req.num_generated_tokens += 1
+                        if req.decode_start_time is None:
+                            req.decode_start_time = current_time
+                            ms.record_decode_start(req.id, current_time, self.ctx.decode_node_id)
+                        if req.num_generated_tokens >= req.decode_tokens:
+                            req.decode_end_time = step_end
+                            req.status = RequestStatus.COMPLETED
+                            ms.record_decode_end(req.id, step_end)
+
+                    current_time = step_end
 
             decode_free_time = current_time
 
@@ -488,6 +871,519 @@ class DistributedInferenceSimulator:
         )
 
 
+# ─── Colocated 模拟器 ──────────────────────────────────────────────────────────
+
+
+class ColocatedSimulator:
+    """Colocated (非分离) 推理模拟器。
+
+    Prefill 和 Decode 共享同一组 GPU。每个 iteration 中，
+    scheduler 从等待队列中选取请求，组成包含 prefill 和 decode
+    请求的混合 batch。
+
+    关键区别:
+    - 无 KV Cache 传输延迟 (无 RDMA)
+    - Prefill 和 Decode 竞争同一组 GPU 资源
+    - Iteration 时间由混合 batch 中最慢的请求决定
+    - TTFT = 第一个 decode token 的生成时间 - 请求到达时间
+    """
+
+    SUPPORTED_SCHEDULERS = DisaggregatedSimulator.SUPPORTED_SCHEDULERS
+
+    def __init__(
+        self,
+        ctx: SimContext,
+        config: SimulationConfig,
+        schedule_policy: str = "fcfs",
+    ):
+        self.ctx = ctx
+        self.config = config
+        self._request_counter = 0
+        self._rng = np.random.default_rng(config.seed)
+        self._policy = schedule_policy
+        self._advanced_schedulers = AdvancedSchedulers(seed=config.seed)
+
+    def _compute_moe_imbalance_factor(self, num_tokens: int) -> float:
+        """计算 MoE 专家负载不均衡因子 (同 DisaggregatedSimulator)。"""
+        model = self.ctx.model_config
+        if model.num_experts <= 0:
+            return 1.0
+
+        alpha = self.config.disaggregated.moe_expert_load_zipf_alpha
+        num_experts = model.num_experts
+        top_k = model.top_k_experts
+
+        rng = self._rng
+        ranks = np.arange(1, num_experts + 1, dtype=float)
+        weights = 1.0 / (ranks ** alpha)
+        weights /= weights.sum()
+
+        expert_loads = np.zeros(num_experts, dtype=np.int64)
+        for _ in range(num_tokens):
+            chosen = rng.choice(num_experts, size=top_k, replace=False, p=weights)
+            expert_loads[chosen] += 1
+
+        ep_size = min(num_experts, self.ctx.tp_size)
+        experts_per_gpu = num_experts // ep_size
+
+        # Per-expert latency (Roofline 模型)
+        ep_model = ExpertParallelModel(model, ep_size, device_config=self.ctx.device_config)
+        per_expert_latencies = ep_model._compute_per_expert_latencies(expert_loads)
+
+        # GPU 级延迟
+        gpu_latencies = np.zeros(ep_size, dtype=np.float64)
+        for gpu_id in range(ep_size):
+            start = gpu_id * experts_per_gpu
+            end = start + experts_per_gpu
+            gpu_latencies[gpu_id] = per_expert_latencies[start:end].sum()
+
+        max_latency = float(gpu_latencies.max())
+        avg_latency = float(gpu_latencies[gpu_latencies > 0].mean())
+        return max_latency / avg_latency if avg_latency > 0 else 1.0
+
+    def _apply_tp_overlap(self, compute_ms: float, comm_ms: float) -> float:
+        """应用通信-计算重叠模型 (同 DisaggregatedSimulator)。"""
+        if comm_ms <= 0:
+            return compute_ms
+
+        proc = self.ctx.overlap_processor
+        pair = proc.make_compute_comm_pair(compute_ms, comm_ms)
+        pair = proc.apply_ratio_slowdown(pair)
+        return max(pair.adjusted_a_ms, pair.adjusted_b_ms)
+
+    def _create_request(self, arrival_time: float) -> Request:
+        req_config = self.config.request
+        prefill_tokens = self._sample_length(req_config.prefill_length)
+        decode_tokens = self._sample_length(req_config.decode_length)
+        req = Request(
+            id=self._request_counter,
+            arrival_time=arrival_time,
+            prefill_tokens=prefill_tokens,
+            decode_tokens=decode_tokens,
+        )
+        self._request_counter += 1
+        return req
+
+    def _sample_length(self, mean: int) -> int:
+        dist = self.config.request.length_distribution
+        if dist == "fixed":
+            return mean
+        cv = self.config.request.length_cv
+        std = mean * cv
+        return max(1, int(self._rng.normal(mean, std)))
+
+    def _generate_requests(self) -> List[Request]:
+        requests = []
+        current_time = 0.0
+        qps = self.config.request.qps
+        time_limit_ms = self.config.time_limit_s * 1e3
+
+        while current_time < time_limit_ms:
+            req = self._create_request(current_time)
+            requests.append(req)
+            self.ctx.requests[req.id] = req
+            interval_s = self._rng.exponential(1.0 / qps) if qps > 0 else float("inf")
+            current_time += interval_s * 1e3
+
+        return requests
+
+    def _compute_tp_allreduce_time(self, num_tokens: int) -> float:
+        tp = self.ctx.tp_size
+        if tp <= 1:
+            return 0.0
+        data_size = num_tokens * self.ctx.model_config.embedding_dim * 2
+        return self.ctx.nvlink_model.get_allreduce_time(tp, data_size) * 2
+
+    def _compute_dynamic_batch_sizes(self) -> tuple:
+        """动态 batch size (同 DisaggregatedSimulator)。"""
+        model = self.ctx.model_config
+        device = self.ctx.device_config
+        dcfg = self.config.disaggregated
+        num_gpus = self.ctx.tp_size
+
+        if model.num_experts > 0:
+            active_params = model.num_layers * model.embedding_dim * (4 * model.embedding_dim) * 2
+        else:
+            active_params = model.num_layers * model.embedding_dim * (4 * model.embedding_dim) * 2
+        model_size_gb = active_params / 1e9 / num_gpus
+        available_mem_gb = device.memory_gb * dcfg.gpu_memory_utilization - model_size_gb
+        if available_mem_gb <= 0:
+            return 1, 1
+
+        head_dim = model.embedding_dim // model.num_q_heads
+        avg_seq_len = 512 + 128
+        kv_per_req = 2 * model.num_layers * model.num_kv_heads * head_dim * avg_seq_len * 2
+        avg_pf_tokens = self.config.request.prefill_length
+        kv_per_pf = 2 * model.num_layers * model.num_kv_heads * head_dim * avg_pf_tokens * 2
+
+        max_pf = max(1, int(available_mem_gb * 1e9 / max(1, kv_per_pf)))
+        max_dec = max(1, int(available_mem_gb * 1e9 / max(1, kv_per_req)))
+        return min(dcfg.prefill_batch_size, max_pf), min(dcfg.decode_batch_size, max_dec)
+
+    def _compute_prefill_time(self, batch_requests: List[Request]) -> float:
+        """Colocated prefill (支持 chunked prefill，同 DisaggregatedSimulator)。"""
+        total_tokens = sum(r.prefill_tokens for r in batch_requests)
+        batch_size = len(batch_requests)
+
+        dcfg = self.config.disaggregated
+        if dcfg.enable_chunked_prefill and dcfg.prefill_chunk_size > 0:
+            chunk_size = dcfg.prefill_chunk_size
+        else:
+            chunk_size = total_tokens
+
+        if total_tokens <= chunk_size:
+            return self._compute_prefill_chunk(
+                batch_requests, total_tokens, batch_size, kv_cache_size=0
+            )
+
+        total_time = 0.0
+        processed_tokens = 0
+        while processed_tokens < total_tokens:
+            this_chunk = min(chunk_size, total_tokens - processed_tokens)
+            chunk_time = self._compute_prefill_chunk(
+                batch_requests, this_chunk, batch_size, kv_cache_size=processed_tokens
+            )
+            total_time += chunk_time
+            processed_tokens += this_chunk
+
+        return total_time
+
+    def _compute_prefill_chunk(
+        self,
+        batch_requests: List[Request],
+        num_tokens: int,
+        batch_size: int,
+        kv_cache_size: int,
+    ) -> float:
+        """计算单个 prefill chunk 的执行时间 (同 DisaggregatedSimulator)。"""
+        model = self.ctx.model_config
+
+        exec_time = self.ctx.time_predictor.get_execution_time(
+            num_tokens=num_tokens,
+            batch_size=batch_size,
+            kv_cache_size=kv_cache_size,
+            is_prefill=True,
+        )
+
+        if exec_time.expert_mlp_time > 0:
+            imbalance_factor = self._compute_moe_imbalance_factor(num_tokens)
+            adjusted_total = exec_time.total_time + exec_time.expert_mlp_time * (imbalance_factor - 1.0)
+        else:
+            adjusted_total = exec_time.total_time
+
+        per_layer_time = adjusted_total
+        tp_comm = self._compute_tp_allreduce_time(num_tokens)
+        total_per_layer = self._apply_tp_overlap(per_layer_time, tp_comm)
+
+        return total_per_layer * model.num_layers
+
+    def _compute_decode_step_time(self, batch_requests: List[Request]) -> float:
+        batch_size = len(batch_requests)
+        num_tokens = batch_size
+        model = self.ctx.model_config
+
+        avg_kv_cache = sum(
+            r.prefill_tokens + r.num_generated_tokens for r in batch_requests
+        ) // max(1, batch_size)
+
+        exec_time = self.ctx.time_predictor.get_execution_time(
+            num_tokens=num_tokens,
+            batch_size=batch_size,
+            kv_cache_size=avg_kv_cache,
+            is_prefill=False,
+        )
+
+        # MoE 负载不均衡调整
+        if exec_time.expert_mlp_time > 0:
+            imbalance_factor = self._compute_moe_imbalance_factor(num_tokens)
+            adjusted_total = exec_time.total_time + exec_time.expert_mlp_time * (imbalance_factor - 1.0)
+        else:
+            adjusted_total = exec_time.total_time
+
+        per_layer_time = adjusted_total
+        tp_comm = self._compute_tp_allreduce_time(num_tokens)
+        total_per_layer = self._apply_tp_overlap(per_layer_time, tp_comm)
+
+        return total_per_layer * model.num_layers
+
+    def _compute_mixed_batch_time(
+        self,
+        prefill_reqs: List[Request],
+        decode_reqs: List[Request],
+    ) -> float:
+        """计算混合 batch (prefill + decode) 的执行时间。
+
+        在 colocated 模式下，prefill 和 decode 请求在同一 iteration 中执行。
+        采用 Sarathi 风格的 chunked prefill: prefill 和 decode 合并为一个
+        forward pass，总 token 数 = prefill tokens + decode tokens (每请求 1)。
+        """
+        if not prefill_reqs and not decode_reqs:
+            return 0.0
+
+        prefill_tokens = sum(r.prefill_tokens for r in prefill_reqs)
+        decode_tokens = len(decode_reqs)  # 每 decode 请求 1 token
+        total_tokens = prefill_tokens + decode_tokens
+        total_batch_size = len(prefill_reqs) + len(decode_reqs)
+
+        if total_tokens == 0:
+            return 0.0
+
+        model = self.ctx.model_config
+
+        # 如果有 prefill tokens (compute-bound)，用 prefill 模型
+        # 否则用 decode 模型 (memory-bound)
+        if prefill_tokens > 0:
+            avg_kv = 0
+            is_prefill = True
+        else:
+            avg_kv = sum(
+                r.prefill_tokens + r.num_generated_tokens for r in decode_reqs
+            ) // max(1, len(decode_reqs))
+            is_prefill = False
+
+        exec_time = self.ctx.time_predictor.get_execution_time(
+            num_tokens=total_tokens,
+            batch_size=total_batch_size,
+            kv_cache_size=avg_kv,
+            is_prefill=is_prefill,
+        )
+
+        # MoE 负载不均衡调整
+        if exec_time.expert_mlp_time > 0:
+            imbalance_factor = self._compute_moe_imbalance_factor(total_tokens)
+            adjusted_total = exec_time.total_time + exec_time.expert_mlp_time * (imbalance_factor - 1.0)
+        else:
+            adjusted_total = exec_time.total_time
+
+        per_layer_time = adjusted_total
+        tp_comm = self._compute_tp_allreduce_time(total_tokens)
+        total_per_layer = self._apply_tp_overlap(per_layer_time, tp_comm)
+
+        return total_per_layer * model.num_layers
+
+    def _select_from_queue(
+        self,
+        waiting_queue: List[Request],
+        batch_size: int,
+        policy: str,
+        current_time: float = 0.0,
+    ) -> List[Request]:
+        if len(waiting_queue) <= batch_size:
+            return list(waiting_queue)
+
+        if policy == "fcfs":
+            candidates = sorted(waiting_queue, key=lambda r: r.arrival_time)
+            return candidates[:batch_size]
+        elif policy == "sjf":
+            candidates = sorted(waiting_queue, key=lambda r: (r.prefill_tokens, r.arrival_time))
+            return candidates[:batch_size]
+        elif policy == "ljf":
+            candidates = sorted(waiting_queue, key=lambda r: (-r.prefill_tokens, r.arrival_time))
+            return candidates[:batch_size]
+        elif policy == "srtf":
+            candidates = sorted(waiting_queue, key=lambda r: (r.decode_tokens, r.arrival_time))
+            return candidates[:batch_size]
+        elif policy == "random":
+            indices = self._rng.choice(len(waiting_queue), size=batch_size, replace=False)
+            return [waiting_queue[i] for i in indices]
+        elif policy == "mlfq":
+            return self._advanced_schedulers.select_mlfq(waiting_queue, batch_size, current_time)
+        elif policy == "po":
+            return self._advanced_schedulers.select_po(waiting_queue, batch_size)
+        elif policy == "opt":
+            return self._advanced_schedulers.select_opt(waiting_queue, batch_size, current_time)
+        elif policy == "lightllm":
+            has_prefilled = any(r.num_generated_tokens > 0 for r in waiting_queue)
+            if has_prefilled:
+                return self._advanced_schedulers.select_lightllm_decode(waiting_queue, batch_size)
+            else:
+                return self._advanced_schedulers.select_lightllm_prefill(waiting_queue, batch_size, current_time)
+        else:
+            return waiting_queue[:batch_size]
+
+    def run(self) -> MetricsStore:
+        """运行 Colocated 模式模拟。
+
+        调度逻辑:
+        1. 维护统一等待队列: 请求到达后入队
+        2. 每次 iteration:
+           a. 从队列中选取新请求做 prefill (受 max_prefill_per_iter 限制)
+           b. 将所有已 prefill 完成的请求加入 decode batch
+           c. 执行混合 batch (prefill 新请求 + decode 进行中的请求)
+        3. Prefill 完成 → 请求进入 decode 阶段
+        4. Decode 完成 → 请求结束
+        """
+        ms = self.ctx.metrics_store
+        all_requests = self._generate_requests()
+        all_requests.sort(key=lambda r: r.arrival_time)
+        total_requests = len(all_requests)
+
+        logger.info(f"Colocated 模式: 生成 {total_requests} 个请求")
+        logger.info(f"集群: 1 节点, {self.ctx.num_gpus_per_node} GPU (A800), TP={self.ctx.tp_size}")
+        logger.info(f"调度策略: {self._policy}")
+
+        max_prefill_per_iter, max_batch_size = self._compute_dynamic_batch_sizes()
+
+        # 记录到达信息
+        for req in all_requests:
+            ms.record_request_arrival(req.id, req.arrival_time)
+            ms.set_request_tokens(req.id, req.prefill_tokens, req.decode_tokens)
+
+        arrival_idx = 0
+        waiting_queue: List[Request] = []
+        prefilling: Dict[int, Request] = {}   # req.id -> Request (正在 prefill)
+        decoding: Dict[int, Request] = {}     # req.id -> Request (正在 decode)
+        current_time = 0.0
+
+        while arrival_idx < total_requests or waiting_queue or prefilling or decoding:
+            # 将所有已到达的请求加入等待队列
+            while arrival_idx < total_requests and all_requests[arrival_idx].arrival_time <= current_time:
+                waiting_queue.append(all_requests[arrival_idx])
+                arrival_idx += 1
+
+            # 选取新请求做 prefill
+            prefill_batch = []
+            if waiting_queue:
+                prefill_candidates = self._select_from_queue(
+                    waiting_queue, max_prefill_per_iter, self._policy, current_time
+                )
+                for req in prefill_candidates:
+                    waiting_queue.remove(req)
+                    req.status = RequestStatus.PREFILLING
+                    req.prefill_node_id = 0
+                    req.prefill_start_time = current_time
+                    ms.record_prefill_start(req.id, current_time, 0)
+                    prefill_batch.append(req)
+
+            # Decode batch: 所有已 prefill 完成但 decode 未完成的请求
+            decode_batch = list(decoding.values())
+
+            if not prefill_batch and not decode_batch:
+                # 无活跃请求，跳到下一个到达时间
+                if arrival_idx < total_requests:
+                    current_time = all_requests[arrival_idx].arrival_time
+                    continue
+                else:
+                    break
+
+            # 执行混合 batch
+            step_time = self._compute_mixed_batch_time(prefill_batch, decode_batch)
+            step_end = current_time + step_time
+
+            # Prefill 完成的请求 → 进入 decode
+            for req in prefill_batch:
+                req.prefill_end_time = step_end
+                ms.record_prefill_end(req.id, step_end)
+                req.status = RequestStatus.DECODING
+                req.decode_node_id = 0
+                req.decode_start_time = step_end
+                ms.record_decode_start(req.id, step_end, 0)
+                ms.record_kv_cache_transfer_start(req.id, step_end)
+                ms.record_kv_cache_transfer_end(req.id, step_end)  # colocated: 0 delay
+                decoding[req.id] = req
+
+            # Decode step: 每个活跃请求生成 1 个 token
+            completed_ids = []
+            for req_id, req in decoding.items():
+                req.num_generated_tokens += 1
+                if req.num_generated_tokens >= req.decode_tokens:
+                    req.decode_end_time = step_end
+                    req.status = RequestStatus.COMPLETED
+                    ms.record_decode_end(req.id, step_end)
+                    completed_ids.append(req_id)
+
+            for req_id in completed_ids:
+                del decoding[req_id]
+
+            current_time = step_end
+
+            logger.debug(
+                f"Iteration: prefill={len(prefill_batch)}, decode={len(decode_batch)}, "
+                f"step_time={step_time:.2f}ms, queue={len(waiting_queue)}"
+            )
+
+        ms.finalize()
+        return ms
+
+
+def create_colocated_simulator(
+    num_gpus_per_node: int = 4,
+    qps: float = 10.0,
+    prefill_length: int = 512,
+    decode_length: int = 128,
+    prefill_batch_size: int = 4,
+    decode_batch_size: int = 32,
+    tp_size: int = 4,
+    nvlink_bandwidth_gbps: float = 600.0,
+    model_name: str = "Qwen3-30B-A3B",
+    num_layers: int = 48,
+    time_limit_s: float = 60.0,
+    seed: int = 42,
+    schedule_policy: str = "fcfs",
+    length_distribution: str = "fixed",
+    profiling_dir: Optional[str] = None,
+    predictor_type: str = "auto",
+) -> ColocatedSimulator:
+    """快速创建 Colocated (非分离) 模拟器。
+
+    集群拓扑: 1 节点 num_gpus_per_node 张 A800, prefill + decode 共享。
+    
+    Args:
+        profiling_dir: profiling 数据目录路径（可选）
+        predictor_type: 预测器类型 ("auto", "analytical", "profiled", "random_forest")
+    """
+    from distlmsim.types import RDMAProtocolType
+
+    device = DeviceSKUConfig()
+    model = ModelConfig(
+        model_name=model_name,
+        num_layers=num_layers,
+        num_q_heads=32,
+        num_kv_heads=4,
+        embedding_dim=2048,
+        num_experts=128,
+        top_k_experts=8,
+    )
+    nvlink = NVLinkConfig(bandwidth_gbps=nvlink_bandwidth_gbps)
+    rdma = RDMAConfig(protocol=RDMAProtocolType.ROCE_V2, bandwidth_gbps=200.0)
+    network = NetworkTopologyConfig(nvlink=nvlink, rdma=rdma)
+
+    metrics_config = MetricsConfig()
+    ms = MetricsStore(metrics_config)
+
+    ctx = SimContext(
+        model_config=model,
+        device_config=device,
+        network_config=network,
+        num_gpus_per_node=num_gpus_per_node,
+        tp_size=tp_size,
+        metrics_store=ms,
+        profiling_dir=profiling_dir,
+        predictor_type=predictor_type,
+    )
+
+    config = SimulationConfig(
+        seed=seed,
+        time_limit_s=time_limit_s,
+        disaggregated=DisaggregatedConfig(
+            enabled=False,
+            num_prefill_nodes=0,
+            num_decode_nodes=0,
+            prefill_batch_size=prefill_batch_size,
+            decode_batch_size=decode_batch_size,
+        ),
+        request=RequestGeneratorConfig(
+            qps=qps,
+            prefill_length=prefill_length,
+            decode_length=decode_length,
+            length_distribution=length_distribution,
+        ),
+        metrics=metrics_config,
+    )
+
+    return ColocatedSimulator(ctx, config, schedule_policy=schedule_policy)
+
+
 # ─── 便捷工厂函数 ────────────────────────────────────────────────────────────
 
 
@@ -509,10 +1405,16 @@ def create_disaggregated_simulator(
     prefill_schedule_policy: str = "fcfs",
     decode_schedule_policy: str = "fcfs",
     length_distribution: str = "fixed",
+    profiling_dir: Optional[str] = None,
+    predictor_type: str = "auto",
 ) -> DisaggregatedSimulator:
     """快速创建存算分离模拟器。
 
     集群拓扑: 1 Prefill 节点 + 1 Decode 节点，每节点 num_gpus_per_node 张 A800。
+    
+    Args:
+        profiling_dir: profiling 数据目录路径（可选）
+        predictor_type: 预测器类型 ("auto", "analytical", "profiled", "random_forest")
     """
     from distlmsim.types import RDMAProtocolType
 
@@ -540,6 +1442,8 @@ def create_disaggregated_simulator(
         num_gpus_per_node=num_gpus_per_node,
         tp_size=tp_size,
         metrics_store=ms,
+        profiling_dir=profiling_dir,
+        predictor_type=predictor_type,
     )
 
     config = SimulationConfig(

@@ -111,8 +111,13 @@ class ReplicaScheduleEvent(BaseEvent):
         scheduler: "BaseGlobalScheduler",
         metrics_store: "MetricsStore",
     ) -> List[BaseEvent]:
-        # TODO: 调用副本级调度器，形成 Batch，生成 BatchStageArrivalEvent
-        raise NotImplementedError("ReplicaScheduleEvent.handle_event")
+        """副本级调度：将请求加入副本的批处理队列。
+
+        当前 main.py 使用自己的仿真循环，此事件系统集成 planned for future work。
+        实现时需：调用副本级调度器，形成 Batch，生成 BatchStageArrivalEvent。
+        """
+        metrics_store.record_request_scheduled(self._request_id, self._time)
+        return []  # Future: 返回 BatchStageArrivalEvent
 
 
 class BatchStageArrivalEvent(BaseEvent):
@@ -129,8 +134,14 @@ class BatchStageArrivalEvent(BaseEvent):
         scheduler: "BaseGlobalScheduler",
         metrics_store: "MetricsStore",
     ) -> List[BaseEvent]:
-        # TODO: 计算执行时间，生成 BatchStageEndEvent
-        raise NotImplementedError("BatchStageArrivalEvent.handle_event")
+        # Future: 计算执行时间，生成 BatchStageEndEvent
+        # 当前 main.py 使用自己的仿真循环处理 pipeline stage 执行
+        return [
+            BatchStageEndEvent(
+                self._time, self._batch_id, self._stage_id,
+                self._replica_id, num_stages=1  # 默认单 stage
+            )
+        ]
 
 
 class BatchStageEndEvent(BaseEvent):
@@ -177,8 +188,9 @@ class BatchEndEvent(BaseEvent):
         scheduler: "BaseGlobalScheduler",
         metrics_store: "MetricsStore",
     ) -> List[BaseEvent]:
-        # TODO: 更新请求状态，判断是否继续 decode 或完成
-        raise NotImplementedError("BatchEndEvent.handle_event")
+        # Future: 更新请求状态，判断是否继续 decode 或完成
+        # 当前 main.py 使用自己的仿真循环处理 batch 完成逻辑
+        return []
 
 
 # ─── 存算分离事件 ──────────────────────────────────────────────────────────────
@@ -226,8 +238,23 @@ class KVCacheTransferStartEvent(BaseEvent):
         scheduler: "BaseGlobalScheduler",
         metrics_store: "MetricsStore",
     ) -> List[BaseEvent]:
-        # TODO: 通过 RDMA 模型计算传输时间
-        transfer_time_ms = 0.0  # stub
+        """通过 RDMA 模型计算 KV Cache 传输时间。
+
+        使用 scheduler 中的 rdma_model 计算传输延迟，
+        考虑协议开销和拥塞因子。
+        """
+        rdma_model = getattr(scheduler, '_rdma_model', None)
+        if rdma_model is not None:
+            transfer_time_ms = rdma_model.get_transfer_time(
+                self._kv_cache_size_bytes
+            )
+        else:
+            # 回退: 简单带宽延迟模型 (200 Gbps RDMA)
+            bandwidth_bps = 200e9 / 8  # 200 Gbps → B/s
+            latency_ms = 2e-3  # 2 μs
+            transfer_time_ms = self._kv_cache_size_bytes / bandwidth_bps * 1e3 + latency_ms
+
+        metrics_store.record_kv_cache_transfer_start(self._request_id, self._time)
         end_time = self._time + transfer_time_ms
         return [
             KVCacheTransferEndEvent(
@@ -266,8 +293,10 @@ class DecodeStartEvent(BaseEvent):
         scheduler: "BaseGlobalScheduler",
         metrics_store: "MetricsStore",
     ) -> List[BaseEvent]:
-        # TODO: 将请求分配到 Decode 节点的副本
-        raise NotImplementedError("DecodeStartEvent.handle_event")
+        # Future: 将请求分配到 Decode 节点的副本
+        # 当前 main.py 使用自己的仿真循环处理 decode 调度
+        metrics_store.record_decode_start(self._request_id, self._time)
+        return []
 
 
 # ─── 专家并行事件 ──────────────────────────────────────────────────────────────
@@ -286,8 +315,9 @@ class ExpertAssignmentEvent(BaseEvent):
         scheduler: "BaseGlobalScheduler",
         metrics_store: "MetricsStore",
     ) -> List[BaseEvent]:
-        # TODO: 执行 Top-K 路由 + 负载均衡，生成 ExpertCommStartEvent
-        raise NotImplementedError("ExpertAssignmentEvent.handle_event")
+        # Future: 执行 Top-K 路由 + 负载均衡，生成 ExpertCommStartEvent
+        # 当前 main.py 通过 _compute_moe_imbalance_factor() 处理 MoE 路由
+        return [ExpertCommStartEvent(self._time, self._batch_id, self._replica_id)]
 
 
 class ExpertCommStartEvent(BaseEvent):
@@ -303,8 +333,17 @@ class ExpertCommStartEvent(BaseEvent):
         scheduler: "BaseGlobalScheduler",
         metrics_store: "MetricsStore",
     ) -> List[BaseEvent]:
-        # TODO: 通过 RDMA 模型计算 all-to-all 通信时间
-        raise NotImplementedError("ExpertCommStartEvent.handle_event")
+        # Future: 通过 RDMA 模型计算 all-to-all 通信时间
+        # 当前 main.py 通过 expert_parallel_comm_time 处理 EP 通信
+        rdma_model = getattr(scheduler, '_rdma_model', None)
+        comm_time_ms = 0.0
+        if rdma_model is not None:
+            # 估算 all-to-all 数据量: batch_size * top_k * hidden_dim * 2 bytes
+            estimated_bytes = 1024 * 8 * 2048 * 2  # 典型 MoE 配置
+            comm_time_ms = rdma_model.get_alltoall_time(2, estimated_bytes)
+        return [ExpertCommEndEvent(
+            self._time + comm_time_ms, self._batch_id, self._replica_id
+        )]
 
 
 class ExpertCommEndEvent(BaseEvent):
@@ -320,5 +359,6 @@ class ExpertCommEndEvent(BaseEvent):
         scheduler: "BaseGlobalScheduler",
         metrics_store: "MetricsStore",
     ) -> List[BaseEvent]:
-        # TODO: 通信完成，继续后续 pipeline stage
-        raise NotImplementedError("ExpertCommEndEvent.handle_event")
+        # Future: 通信完成，继续后续 pipeline stage
+        # 当前 main.py 使用自己的仿真循环处理后续流程
+        return []

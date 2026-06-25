@@ -62,6 +62,7 @@ class RDMAConfig:
     latency_us: float = 2.0            # 基础延迟 (微秒)
     # RoCEv2 特有参数
     congestion_control: str = "DCQCN"  # 拥塞控制算法
+    congestion_alpha: float = 0.05     # 拥塞敏感度 (每增加一个并发流，带宽降低比例)
     ecn_enabled: bool = True           # ECN 显式拥塞通知
     pfc_enabled: bool = True           # PFC 优先级流控
     # InfiniBand 特有参数
@@ -97,6 +98,7 @@ class ModelConfig:
     mlp_hidden_dim: int = 0            # 0 表示从模型自动推导
     num_experts: int = 128             # MoE 专家数，0 表示 Dense
     top_k_experts: int = 8             # Top-K 路由
+    expert_intermediate_dim: int = 0   # MoE 专家中间维度，0 表示从模型自动推导
     vocab_size: int = 151936
 
 
@@ -141,12 +143,27 @@ class DisaggregatedConfig:
     kv_cache_transfer_strategy: KVCacheTransferStrategy = KVCacheTransferStrategy.DIRECT
     kv_cache_compression: bool = False  # KV Cache 压缩 (如 FP8)
     kv_cache_compression_ratio: float = 2.0
+    # Store-and-Forward 参数
+    store_forward_write_bw_gbps: float = 12.0   # 写入中间存储带宽 (如 NVMe: ~12 GB/s = 96 Gbps)
+    store_forward_read_bw_gbps: float = 12.0    # 从中间存储读取带宽
+    store_forward_latency_us: float = 100.0     # 存储 I/O 基础延迟 (μs)
     # 调度参数
-    prefill_batch_size: int = 32        # Prefill 批大小
-    decode_batch_size: int = 256        # Decode 批大小
+    prefill_batch_size: int = 32        # Prefill 批大小 (上限，实际受 GPU 显存约束)
+    decode_batch_size: int = 256        # Decode 批大小 (上限，实际受 GPU 显存约束)
+    gpu_memory_utilization: float = 0.90  # GPU 显存利用率 (0-1, 预留 10% 给框架开销)
     # Chunked Prefill
     enable_chunked_prefill: bool = True
     prefill_chunk_size: int = 4096
+    # Speculative Decoding
+    enable_speculative_decoding: bool = False
+    speculation_length: int = 4         # Draft model 生成的 candidate token 数 K
+    acceptance_rate: float = 0.8        # 平均接受率 (0-1)
+    # Draft model: 用较小的模型参数近似 (层数少 = 计算快)
+    draft_num_layers: int = 4           # Draft model 层数 (target 48)
+    draft_embedding_dim: int = 512      # Draft model 隐藏维度 (target 2048)
+    # MoE Expert Load Imbalance
+    moe_expert_load_zipf_alpha: float = 1.0  # Zipf α 控制 token→expert 分布偏斜度
+                                              # 1.0 = 均匀, >1.0 = 偏斜
 
 
 # ─── 调度配置 ─────────────────────────────────────────────────────────────────
