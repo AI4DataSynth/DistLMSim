@@ -238,3 +238,13 @@ data/profiling/**/*.csv
 
 # Unit tests (run locally with: python3 tests/run_tests.py)
 tests/
+
+# Non-simulator artifacts (documentation, TODOs, profiling reports)
+specification.md
+*TODO*.md
+*REPORT*.md
+*SUMMARY*.md
+*STATUS*.md
+scripts/*.md
+scripts/*.sh
+scripts/*.exp
