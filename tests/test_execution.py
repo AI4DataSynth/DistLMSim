@@ -127,7 +127,7 @@ class TestRandomForestPredictor(unittest.TestCase):
         """Verify RF predictor falls back to analytical model."""
         model_config = ModelConfig()
         device_config = DeviceSKUConfig()
-        predictor = RandomForestPredictor(model_config, device_config)
+        predictor = RandomForestPredictor(model_config, device_config, profiling_dir="data/profiling")
         result = predictor.get_execution_time(
             num_tokens=128,
             batch_size=4,

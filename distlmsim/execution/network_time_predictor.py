@@ -21,11 +21,12 @@ class NetworkTimePredictor:
     支持混合模式：优先使用 profiling 数据，回退到解析模型。
     """
 
-    def __init__(self, config: NetworkTopologyConfig, num_gpus_per_node: int = 8):
+    def __init__(self, config: NetworkTopologyConfig, num_gpus_per_node: int = 8, profiling_dir: Optional[str] = None):
         self._config = config
-        self._nvlink = NVLinkModel(config.nvlink, num_gpus_per_node)
-        self._rdma = RDMAModel(config.rdma)
+        self._nvlink = NVLinkModel(config.nvlink, num_gpus_per_node, profiling_dir=profiling_dir)
+        self._rdma = RDMAModel(config.rdma, profiling_dir=profiling_dir)
         self._mode = config.model_mode
+        self._num_gpus_per_node = num_gpus_per_node
 
     def get_tp_allreduce_time(
         self, tp_size: int, data_size_bytes: int
@@ -56,9 +57,11 @@ class NetworkTimePredictor:
     ) -> float:
         """EP All-to-All 时间 (ms)。"""
         if is_cross_node:
-            num_nodes = (ep_size + 7) // 8  # TODO: 正确计算
+            gpus_per_node = self._num_gpus_per_node
+            num_nodes = (ep_size + gpus_per_node - 1) // gpus_per_node
+            data_per_node = data_size_per_gpu_bytes * gpus_per_node
             return self._rdma.get_alltoall_time(
-                num_nodes, data_size_per_gpu_bytes * ep_size
+                num_nodes, data_per_node
             ) * 2  # dispatch + combine
         else:
             return self._nvlink.get_alltoall_time(ep_size, data_size_per_gpu_bytes) * 2

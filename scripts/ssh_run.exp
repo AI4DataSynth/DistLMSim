@@ -1,0 +1,26 @@
+#!/usr/bin/expect -f
+# SSH 自动登录脚本 - 支持多行命令
+set host [lindex $argv 0]
+set user "shengxiang"
+set password "xiangsheng218"
+set cmdfile [lindex $argv 1]
+
+set timeout 30
+
+# 读取命令文件
+set f [open $cmdfile r]
+set cmd [read $f]
+close $f
+
+spawn ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 $user@$host $cmd
+expect {
+    "yes/no" {
+        send "yes\r"
+        exp_continue
+    }
+    "password: " {
+        send "$password\r"
+    }
+    eof
+}
+expect eof

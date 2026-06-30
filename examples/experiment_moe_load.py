@@ -166,6 +166,18 @@ def run_experiment(
 
 def plot_results(results: Dict, output_dir: Path):
     """绘制实验结果图表。"""
+    import matplotlib.pyplot as plt
+    
+    plt.rcParams.update({
+        'font.size': 24,
+        'axes.titlesize': 28,
+        'axes.labelsize': 26,
+        'xtick.labelsize': 22,
+        'ytick.labelsize': 22,
+        'legend.fontsize': 22,
+        'figure.titlesize': 32,
+    })
+    
     alphas = results["config"]["alphas"]
     strategies = list(results["strategies"][alphas[0]].keys())
 
@@ -185,15 +197,15 @@ def plot_results(results: Dict, output_dir: Path):
 
     # 创建图表
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle("MoE Expert Load Balancing: Zipf α vs Strategy Performance", fontsize=16)
+    fig.suptitle("MoE Expert Load Balancing: Zipf α vs Strategy Performance", fontsize=28)
 
     # 1. Max Load
     ax = axes[0, 0]
     for strategy in strategies:
         ax.plot(alphas, max_loads[strategy], marker='o', label=strategy, linewidth=2)
     ax.set_xlabel("Zipf α (token distribution skew)")
-    ax.set_ylabel("Max GPU Load")
-    ax.set_title("Max GPU Load (lower is better)")
+    ax.set_ylabel("Max GPU Load", labelpad=10)
+    ax.set_title("Max GPU Load")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -202,8 +214,8 @@ def plot_results(results: Dict, output_dir: Path):
     for strategy in strategies:
         ax.plot(alphas, deviations[strategy], marker='s', label=strategy, linewidth=2)
     ax.set_xlabel("Zipf α")
-    ax.set_ylabel("Load Deviation (max - avg)")
-    ax.set_title("Load Imbalance (lower is better)")
+    ax.set_ylabel("Load Deviation", labelpad=10)
+    ax.set_title("Load Imbalance")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -213,8 +225,8 @@ def plot_results(results: Dict, output_dir: Path):
         ratios = [m / a if a > 0 else 0 for m, a in zip(max_loads[strategy], avg_loads[strategy])]
         ax.plot(alphas, ratios, marker='^', label=strategy, linewidth=2)
     ax.set_xlabel("Zipf α")
-    ax.set_ylabel("Max Load / Avg Load Ratio")
-    ax.set_title("Load Imbalance Ratio (closer to 1.0 is better)")
+    ax.set_ylabel("Max/Avg Load Ratio", labelpad=10)
+    ax.set_title("Imbalance Ratio")
     ax.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5)
     ax.legend()
     ax.grid(True, alpha=0.3)
@@ -225,8 +237,8 @@ def plot_results(results: Dict, output_dir: Path):
         if any(m > 0 for m in migrations[strategy]):
             ax.plot(alphas, migrations[strategy], marker='D', label=strategy, linewidth=2)
     ax.set_xlabel("Zipf α")
-    ax.set_ylabel("Number of Migrations")
-    ax.set_title("Migration Overhead (lower is better)")
+    ax.set_ylabel("Migrations", labelpad=10)
+    ax.set_title("Migration Overhead")
     ax.legend()
     ax.grid(True, alpha=0.3)
 

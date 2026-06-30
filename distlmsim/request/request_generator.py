@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import csv
 import itertools
+import os
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
@@ -139,7 +141,7 @@ class BaseRequestGenerator(ABC):
     def from_config(cls, config: RequestGeneratorConfig) -> "BaseRequestGenerator":
         """根据配置创建请求生成器。"""
         if config.generator_type == "trace_replay":
-            return TraceReplayRequestGenerator(config)
+            return TraceReplayRequestGenerator(config, trace_file=config.trace_file or "")
         return SyntheticRequestGenerator(config)
 
     @abstractmethod
@@ -280,19 +282,49 @@ class SyntheticRequestGenerator(BaseRequestGenerator):
 class TraceReplayRequestGenerator(BaseRequestGenerator):
     """Trace 回放请求生成器。
 
-    从 trace 文件中读取请求序列，按时间戳回放。
-
-    TODO: 实现 trace 文件解析。
+    从 CSV trace 文件中读取请求序列，按时间戳回放。
+    Trace 文件格式: arrival_time_ms,prefill_tokens,decode_tokens
     """
 
-    def __init__(self, config: RequestGeneratorConfig):
+    def __init__(self, config: RequestGeneratorConfig, trace_file: str = ""):
         self._config = config
         self._trace_index = 0
+        self._trace_entries: List[dict] = []
+        if trace_file and os.path.exists(trace_file):
+            self._load_trace(trace_file)
+
+    def _load_trace(self, trace_file: str) -> None:
+        """Load trace entries from CSV file."""
+        with open(trace_file, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                self._trace_entries.append({
+                    'arrival_time_ms': float(row.get('arrival_time_ms', 0)),
+                    'prefill_tokens': int(row.get('prefill_tokens', 128)),
+                    'decode_tokens': int(row.get('decode_tokens', 128)),
+                })
 
     def generate_initial_events(self) -> List[BaseEvent]:
-        # TODO: 从 trace 文件加载
-        return []
+        """Generate RequestArrivalEvents from trace entries at their arrival times."""
+        events = []
+        for i, entry in enumerate(self._trace_entries):
+            # Only create events for requests arriving at time 0
+            if entry['arrival_time_ms'] <= 0:
+                request_id = next(_request_id_counter)
+                evt = RequestArrivalEvent(time=0.0, request_id=request_id)
+                events.append(evt)
+        self._trace_index = len(events)
+        return events
 
     def generate_next_request(self, current_time: float) -> Optional[BaseEvent]:
-        # TODO: 读取下一条 trace
+        """Get the next trace entry whose arrival time is >= current_time."""
+        while self._trace_index < len(self._trace_entries):
+            entry = self._trace_entries[self._trace_index]
+            self._trace_index += 1
+            if entry['arrival_time_ms'] >= current_time:
+                request_id = next(_request_id_counter)
+                return RequestArrivalEvent(
+                    time=entry['arrival_time_ms'],
+                    request_id=request_id,
+                )
         return None

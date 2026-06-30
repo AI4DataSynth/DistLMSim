@@ -49,10 +49,12 @@ class PipelineParallelModel:
         model_config: ModelConfig,
         pp_size: int,
         tp_size: int = 1,
+        gpus_per_node: int = 8,
     ):
         self._model = model_config
         self._pp_size = pp_size
         self._tp_size = tp_size
+        self._gpus_per_node = gpus_per_node
 
     def create_stages(
         self,
@@ -79,7 +81,7 @@ class PipelineParallelModel:
                 else self._model.num_layers
             )
             gpu_ids = node_gpu_mapping.get(stage_id, [])
-            node_id = gpu_ids[0] // 8 if gpu_ids else 0  # TODO: 正确映射
+            node_id = gpu_ids[0] // self._gpus_per_node if gpu_ids else 0
 
             stages.append(PipelineStage(
                 stage_id=stage_id,
@@ -124,18 +126,31 @@ class PipelineParallelModel:
         self,
         num_micro_batches: int = 4,
         schedule_type: str = "1f1b",
+        num_nodes: Optional[int] = None,
     ) -> PipelineSchedule:
         """创建流水线调度方案。
 
         Args:
             num_micro_batches: 微批数量
             schedule_type: 调度策略 ("1f1b", "gpipe", "interleaved")
+            num_nodes: 可用节点数 (None 则自动计算最小节点数)
 
         Returns:
             PipelineSchedule
         """
-        # TODO: 实现完整的 stage 到节点的映射
-        stages = self.create_stages({i: [i * self._tp_size] for i in range(self._pp_size)})
+        # Build stage-to-GPU mapping
+        if num_nodes is None:
+            # Default: pack stages onto minimum nodes
+            num_nodes = (self._pp_size * self._tp_size + self._gpus_per_node - 1) // self._gpus_per_node
+
+        node_gpu_mapping = {}
+        gpu_counter = 0
+        for stage_id in range(self._pp_size):
+            gpus = list(range(gpu_counter, gpu_counter + self._tp_size))
+            node_gpu_mapping[stage_id] = gpus
+            gpu_counter += self._tp_size
+
+        stages = self.create_stages(node_gpu_mapping)
         return PipelineSchedule(
             stages=stages,
             schedule_type=schedule_type,

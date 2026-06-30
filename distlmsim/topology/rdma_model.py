@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import csv
+import math
+import os
 from typing import Optional
 
 from distlmsim.config import RDMAConfig
@@ -25,9 +28,11 @@ class RDMAModel:
     2. Profiling 模型: 从预采集数据查表
     """
 
-    def __init__(self, config: RDMAConfig, congestion_alpha: float = 0.05):
+    def __init__(self, config: RDMAConfig, congestion_alpha: float = 0.05, profiling_dir: Optional[str] = None):
         self._config = config
         self._congestion_alpha = congestion_alpha
+        self._profiling_dir = profiling_dir
+        self._transfer_profiling_cache: Optional[dict] = None
 
     def get_transfer_time(
         self,
@@ -111,12 +116,44 @@ class RDMAModel:
             return 1.0
         return 1.0 / (1.0 + self._congestion_alpha * (concurrent_transfers - 1))
 
-    def _get_transfer_from_profiling(self, data_size_bytes: int) -> float:
-        """从 profiling 数据查询传输时间。
+    def _load_transfer_profiling(self) -> dict:
+        """加载 profiling CSV 数据，构建 data_size_bytes -> median_time_ms 的映射。"""
+        if self._transfer_profiling_cache is not None:
+            return self._transfer_profiling_cache
+        if not self._profiling_dir:
+            raise FileNotFoundError("No profiling_dir configured")
+        csv_path = os.path.join(self._profiling_dir, "network", "a800_dgx", "tcp_transfer.csv")
+        cache = {}
+        with open(csv_path, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                size = int(row['data_size_bytes'])
+                time_ms = float(row['time_stats.transfer.median'])
+                cache[size] = time_ms
+        self._transfer_profiling_cache = cache
+        return cache
 
-        TODO: 读取 data/profiling/network/ 下对应协议的 CSV
-        """
-        raise NotImplementedError("Profiling-based RDMA model not yet implemented")
+    def _get_transfer_from_profiling(self, data_size_bytes: int) -> float:
+        """从 profiling 数据查询传输时间，支持对数线性插值。"""
+        cache = self._load_transfer_profiling()
+        if data_size_bytes in cache:
+            return cache[data_size_bytes]
+        # Find bracketing entries
+        sizes = sorted(cache.keys())
+        if data_size_bytes < sizes[0]:
+            # Extrapolate from smallest entry
+            return cache[sizes[0]] * (data_size_bytes / sizes[0])
+        if data_size_bytes > sizes[-1]:
+            # Extrapolate from largest entry (bandwidth-limited)
+            return cache[sizes[-1]] * (data_size_bytes / sizes[-1])
+        # Log-linear interpolation between bracketing entries
+        for i in range(len(sizes) - 1):
+            if sizes[i] <= data_size_bytes <= sizes[i + 1]:
+                lo, hi = sizes[i], sizes[i + 1]
+                t_lo, t_hi = cache[lo], cache[hi]
+                frac = math.log(data_size_bytes / lo) / math.log(hi / lo)
+                return t_lo + frac * (t_hi - t_lo)
+        return cache[sizes[-1]]  # fallback
 
     def get_allreduce_time(
         self,

@@ -78,11 +78,23 @@ def run_one(K, alpha, qps, time_limit, seed):
 
 def plot_results(results, output_dir):
     """绘制实验结果图表。"""
+    import matplotlib.pyplot as plt
+    
+    plt.rcParams.update({
+        'font.size': 24,
+        'axes.titlesize': 28,
+        'axes.labelsize': 26,
+        'xtick.labelsize': 22,
+        'ytick.labelsize': 22,
+        'legend.fontsize': 22,
+        'figure.titlesize': 32,
+    })
+    
     K_values = sorted(set(r["K"] for r in results))
     alpha_values = sorted(set(r["alpha"] for r in results))
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle("Speculative Decoding: K vs α Performance", fontsize=16)
+    fig.suptitle("Speculative Decoding: K vs α Performance", fontsize=28)
 
     colors = ["#E74C3C", "#3498DB", "#2ECC71", "#F39C12", "#9B59B6", "#1ABC9C"]
 
@@ -95,7 +107,7 @@ def plot_results(results, output_dir):
         ax.plot(ks, tbts, marker="o", label=f"α={alpha}", color=colors[i], linewidth=2)
     ax.set_xlabel("Speculation Length K")
     ax.set_ylabel("TBT P50 (ms)")
-    ax.set_title("Time Between Tokens (lower = better)")
+    ax.set_title("TBT (lower=better)")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -108,7 +120,7 @@ def plot_results(results, output_dir):
         ax.plot(ks, e2es, marker="s", label=f"α={alpha}", color=colors[i], linewidth=2)
     ax.set_xlabel("Speculation Length K")
     ax.set_ylabel("E2E P50 (ms)")
-    ax.set_title("End-to-End Latency (lower = better)")
+    ax.set_title("E2E Latency (lower=better)")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -150,13 +162,15 @@ def plot_results(results, output_dir):
         ax.set_xticklabels(K_values)
         ax.set_yticks(range(len(alpha_values)))
         ax.set_yticklabels([f"α={a}" for a in alpha_values])
+        ax.yaxis.set_tick_params(pad=8)
         ax.set_xlabel("Speculation Length K")
         ax.set_title("TBT Speedup vs Baseline")
 
+        # Skip first column annotations (baseline ≈ 1.00x, adds no info)
         for i in range(len(alpha_values)):
-            for j in range(len(K_values)):
+            for j in range(1, len(K_values)):
                 ax.text(j, i, f"{speedups[i][j]:.2f}x",
-                        ha="center", va="center", fontsize=9, weight="bold")
+                        ha="center", va="center", fontsize=10, weight="bold")
 
         plt.colorbar(im, ax=ax, shrink=0.8)
 

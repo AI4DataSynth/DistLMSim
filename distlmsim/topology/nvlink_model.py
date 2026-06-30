@@ -6,6 +6,9 @@ A800 DGX: 8 GPU 通过 NVSwitch 全互联，每 GPU 12 条 NVLink3 链路。
 
 from __future__ import annotations
 
+import csv
+import math
+import os
 from typing import Optional
 
 from distlmsim.config import NVLinkConfig
@@ -20,9 +23,11 @@ class NVLinkModel:
     2. Profiling 模型: 从预采集的 CSV 数据查表 (后续实现)
     """
 
-    def __init__(self, config: NVLinkConfig, num_gpus_per_node: int = 8):
+    def __init__(self, config: NVLinkConfig, num_gpus_per_node: int = 8, profiling_dir: Optional[str] = None):
         self._config = config
         self._num_gpus = num_gpus_per_node
+        self._profiling_dir = profiling_dir
+        self._allreduce_profiling_cache: Optional[dict] = None
 
     def get_allreduce_time(
         self,
@@ -70,12 +75,61 @@ class NVLinkModel:
 
         return transfer_time_ms + latency_ms
 
+    def _load_allreduce_profiling(self) -> dict:
+        """加载 All-Reduce profiling CSV 数据到内存缓存。
+
+        Returns:
+            嵌套字典 {num_workers: {size: median_time_ms}}
+        """
+        if self._allreduce_profiling_cache is not None:
+            return self._allreduce_profiling_cache
+        if not self._profiling_dir:
+            raise FileNotFoundError("No profiling_dir configured")
+        csv_path = os.path.join(self._profiling_dir, "network", "a800_dgx", "all_reduce.csv")
+        cache = {}
+        with open(csv_path, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                nw = int(row['num_workers'])
+                size = int(row['size'])
+                time_ms = float(row['time_stats.all_reduce.median'])
+                if nw not in cache:
+                    cache[nw] = {}
+                cache[nw][size] = time_ms
+        self._allreduce_profiling_cache = cache
+        return cache
+
     def _get_allreduce_from_profiling(self, num_gpus: int, data_size_bytes: int) -> float:
         """从 profiling CSV 数据查询 All-Reduce 时间。
 
-        TODO: 读取 data/profiling/network/a800_dgx/all_reduce.csv
+        使用 log-linear 插值处理不在 profiling 数据中的数据大小。
+
+        Args:
+            num_gpus: 参与通信的 GPU 数量 (TP size)
+            data_size_bytes: 数据量 (bytes)
+
+        Returns:
+            通信时间 (ms)
         """
-        raise NotImplementedError("Profiling-based AllReduce model not yet implemented")
+        cache = self._load_allreduce_profiling()
+        if num_gpus not in cache:
+            # Fallback to analytical if no profiling for this TP size
+            return self._get_allreduce_analytical(num_gpus, data_size_bytes)
+        size_map = cache[num_gpus]
+        if data_size_bytes in size_map:
+            return size_map[data_size_bytes]
+        sizes = sorted(size_map.keys())
+        if data_size_bytes < sizes[0]:
+            return size_map[sizes[0]] * (data_size_bytes / sizes[0])
+        if data_size_bytes > sizes[-1]:
+            return size_map[sizes[-1]] * (data_size_bytes / sizes[-1])
+        for i in range(len(sizes) - 1):
+            if sizes[i] <= data_size_bytes <= sizes[i + 1]:
+                lo, hi = sizes[i], sizes[i + 1]
+                t_lo, t_hi = size_map[lo], size_map[hi]
+                frac = math.log(data_size_bytes / lo) / math.log(hi / lo)
+                return t_lo + frac * (t_hi - t_lo)
+        return size_map[sizes[-1]]
 
     def get_send_recv_time(
         self,

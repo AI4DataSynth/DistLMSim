@@ -2,7 +2,7 @@
 
 本文档列出 DistLMSim 需要采集的所有 profiling 数据，按优先级和 GPU 设备组织。
 
-**状态总览 (2026-06-18):** 8/10 项完成 ✅ | 1 项部分完成 ⚠️ | 3 项被阻塞 ❌ (GPU6 不可达)
+**状态总览 (2026-06-27):** 10/11 项完成 ✅ | 1 项部分完成 ⚠️ | 1 项被阻塞 ❌ (GPU1占用)
 
 ## 当前已有数据
 
@@ -14,6 +14,12 @@
 | A800 | Qwen3-30B-A3B | `compute/.../eplb.csv` | **12** | ✅ 重新采集 (EPLB 开销) |
 | A800 | Llama-2-13B | `compute/.../attention.csv` | **37** | ✅ TP=1, prefill+decode |
 | A800 | Llama-2-13B | `compute/.../mlp.csv` | **14** | ✅ 1-8192 tokens |
+| **H100** | Qwen3-30B-A3B | `compute/h100/.../attention.csv` | **106** | ✅ 2026-06-27 |
+| **H100** | Qwen3-30B-A3B | `compute/h100/.../mlp.csv` | **15** | ✅ 2026-06-27 |
+| **H100** | Qwen3-30B-A3B | `compute/h100/.../expert.csv` | **12** | ✅ 2026-06-27 |
+| **H100** | Qwen3-30B-A3B | `compute/h100/.../eplb.csv` | **12** | ✅ 2026-06-27 |
+| **H100** | Llama-2-13B | `compute/h100/.../attention.csv` | **37** | ✅ 2026-06-27 |
+| **H100** | Llama-2-13B | `compute/h100/.../mlp.csv` | **14** | ✅ 2026-06-27 |
 | A800 DGX | - | `network/.../all_reduce.csv` | **26** | ✅ TP=2 + TP=4 |
 | A800 DGX | - | `network/.../expert_comm.csv` | **42** | ✅ EP=2 + EP=4 |
 | A800↔A800 | - | `network/.../tcp_transfer.csv` | **11** | ✅ TCP/IP 1KB-1GB |
@@ -35,9 +41,9 @@
 
 | 机器 | IP | GPU | 数量 | RDMA | 状态 |
 |------|-----|-----|------|------|------|
-| GPU4 | 100.64.0.6 | A800 80GB | 4 | ✅ ConnectX-5 (25Gbps) | 常被占用 |
-| GPU5 | 10.21.16.123 | A800 80GB | 4 | ❌ | - |
-| GPU6 | 10.21.16.124 | H100 80GB PCIe | 2 | ✅ ConnectX-5 (25Gbps) | - |
+| GPU4 | 100.64.0.6 | A800 80GB | 4 | ❓ 不可达 | SSH 超时 |
+| GPU5 | 10.21.16.123 | **H100 80GB PCIe** | **2** | ❌ | GPU0空闲, GPU1满载 |
+| GPU6 | 10.21.16.124 | **A800 80GB** | **4** | ⚠️ ConnectX-5 (双端口DOWN) | 需sudo |
 | GPU2 | 100.64.0.4 | Quadro RTX 6000 | 1 | ❌ | 算力小 |
 | GPU3 | 100.64.0.5 | Quadro RTX 6000 | 1 | ❌ | 通常有30-40GB空闲 |
 
@@ -56,11 +62,10 @@
   - decode attention 范围: 0.15ms (batch=1,kv=64) → 24.65ms (batch=256,kv=4096)
   - 采集环境: GPU4 (A800), PyTorch 2.10, CUDA 12.8
 
-- [ ] **T3: H100 compute profiling — 全新采集** ❌ 被阻塞
+- [x] **T3: H100 compute profiling — 全新采集** ✅ 2026-06-27
   - 目录: `compute/h100/Qwen/Qwen3-30B-A3B/`
-  - 文件: `mlp.csv`, `attention.csv`, `expert.csv`, `eplb.csv`
-  - 参数同 A800 但 H100 硬件规格不同 (FP16=49.5 TFLOPS, HBM3=3350 GB/s)
-  - 机器: GPU6 (H100) — **当前 SSH 不可达 (Network unreachable)**
+  - `mlp.csv` (15 rows), `attention.csv` (106 rows), `expert.csv` (12 rows), `eplb.csv` (12 rows)
+  - 采集环境: GPU5 (H100 PCIe), PyTorch 2.10, CUDA 12.8
 
 - [x] **T4: A800 network profiling — 补全 TP=4** ✅ 2026-06-18
   - 文件: `network/a800_dgx/all_reduce.csv` (26 rows: 13 TP=2 + 13 TP=4)
@@ -74,7 +79,7 @@
   - 目录: `network/h100_pcie/`
   - 文件: `all_reduce.csv`
   - H100 PCIe 无 NVSwitch，NVLink P2P 带宽与 A800 不同
-  - 机器: GPU6 (2x H100) — **当前 SSH 不可达**
+  - 机器: GPU5 (2x H100) — **GPU1 被占用，仅 GPU0 可用，需 2 GPU**
 
 - [⚠️] **T6: 跨节点传输 profiling** — TCP/IP 部分 ✅, RDMA 部分 ❌
   - ✅ `tcp_transfer.csv` (11 rows): GPU4↔GPU5 TCP/IP, 1KB-1GB
@@ -101,10 +106,10 @@
   - `attention.csv`: 37 rows (13 prefill + 24 decode)
   - 采集环境: GPU4 (A800), PyTorch 2.10, CUDA 12.8
 
-- [ ] **T10: H100 Llama-2-13B profiling** ❌ 被阻塞
+- [x] **T10: H100 Llama-2-13B profiling** ✅ 2026-06-27
   - 目录: `compute/h100/Meta/Llama-2-13b-chat-hf/`
-  - 文件: `mlp.csv`, `attention.csv`
-  - 机器: GPU6 — **当前 SSH 不可达**
+  - `mlp.csv` (14 rows), `attention.csv` (37 rows)
+  - 采集环境: GPU5 (H100 PCIe), PyTorch 2.10, CUDA 12.8
 
 ---
 

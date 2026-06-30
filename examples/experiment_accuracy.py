@@ -192,8 +192,20 @@ def run_validation(predictor, attn_df, mlp_df, expert_df, model_config):
 
 def plot_accuracy(results_df, output_dir):
     """绘制精度验证图表。"""
+    import matplotlib.pyplot as plt
+    
+    plt.rcParams.update({
+        'font.size': 24,
+        'axes.titlesize': 28,
+        'axes.labelsize': 26,
+        'xtick.labelsize': 22,
+        'ytick.labelsize': 22,
+        'legend.fontsize': 22,
+        'figure.titlesize': 32,
+    })
+    
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle("Simulation Accuracy: Roofline Prediction vs Profiling (Per-Layer)", fontsize=14)
+    fig.suptitle("Simulation Accuracy: Roofline Prediction vs Profiling (Per-Layer)", fontsize=24)
 
     decode_df = results_df[results_df["phase"] == "decode"]
     prefill_df = results_df[results_df["phase"] == "prefill"]
@@ -209,7 +221,7 @@ def plot_accuracy(results_df, output_dir):
     ax.set_xlabel("Measured Per-Layer Time (ms)")
     ax.set_ylabel("Predicted Per-Layer Time (ms)")
     ax.set_title("Predicted vs Measured")
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=16)
     ax.grid(True, alpha=0.3)
 
     # 2. Error distribution
@@ -223,7 +235,7 @@ def plot_accuracy(results_df, output_dir):
     ax.set_xlabel("Prediction Error (%)")
     ax.set_ylabel("Count")
     ax.set_title("Error Distribution (Roofline-only backend)")
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=16)
     ax.grid(True, alpha=0.3)
 
     # 3. Decode error vs kv_cache_size
@@ -235,7 +247,7 @@ def plot_accuracy(results_df, output_dir):
     ax.set_xlabel("KV Cache Size (tokens)")
     ax.set_ylabel("Error (%)")
     ax.set_title("Decode: Error vs KV Cache Size")
-    ax.legend(fontsize=8, ncol=2)
+    ax.legend(fontsize=18, ncol=2)
     ax.grid(True, alpha=0.3)
 
     # 4. Summary table
@@ -269,16 +281,11 @@ def plot_accuracy(results_df, output_dir):
         table[0, j].set_facecolor("#3498DB")
         table[0, j].set_text_props(weight="bold", color="white")
 
-    ax.set_title("Roofline Accuracy Summary", pad=20, fontsize=13)
+    ax.set_title("Roofline Accuracy Summary", pad=20, fontsize=22)
 
-    # Add note about profiling backend
-    fig.text(0.5, 0.01,
-             "Note: Roofline-only backend shows systematic underestimation for attention kernels.\n"
-             "DistLMSim's hybrid backend (profiled + prediction) achieves significantly better accuracy.",
-             ha="center", fontsize=10, style="italic", alpha=0.7)
+    # Note about profiling backend moved to figure caption
 
     plt.tight_layout()
-    plt.subplots_adjust(bottom=0.1)
     plt.savefig(f"{output_dir}/simulation_accuracy.png", dpi=300, bbox_inches="tight")
     plt.savefig(f"{output_dir}/simulation_accuracy.pdf", bbox_inches="tight")
     plt.close()

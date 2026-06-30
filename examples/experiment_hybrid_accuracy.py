@@ -202,6 +202,16 @@ def plot_hybrid_comparison(results_df, output_dir):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    
+    plt.rcParams.update({
+        'font.size': 24,
+        'axes.titlesize': 28,
+        'axes.labelsize': 26,
+        'xtick.labelsize': 22,
+        'ytick.labelsize': 22,
+        'legend.fontsize': 22,
+        'figure.titlesize': 32,
+    })
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
@@ -225,16 +235,11 @@ def plot_hybrid_comparison(results_df, output_dir):
     bars2 = ax.bar(x + width/2, median_values, width, label="Median", color=[colors.get(n, "#999") for n in names], alpha=0.4)
     ax.set_xlabel("Prediction Backend")
     ax.set_ylabel("Error (%)")
-    ax.set_title("Prediction Accuracy: MAPE by Backend")
+    ax.set_title("MAPE by Backend")
     ax.set_xticks(x)
-    ax.set_xticklabels(names)
-    ax.legend()
+    ax.set_xticklabels(names, rotation=45, ha='right', fontsize=12)
+    ax.legend(loc='upper right', fontsize=12)
     ax.grid(True, alpha=0.3, axis="y")
-
-    # Add value labels
-    for bar in bars1:
-        ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 1,
-                f'{bar.get_height():.1f}%', ha='center', va='bottom', fontsize=9)
 
     # 2. Scatter: predicted vs measured (all predictors)
     ax = axes[1]
@@ -246,9 +251,9 @@ def plot_hybrid_comparison(results_df, output_dir):
     max_val = max(results_df["measured_ms"].max(), results_df["predicted_ms"].max()) * 1.1
     ax.plot([0, max_val], [0, max_val], "k--", alpha=0.5, label="Ideal (y=x)")
     ax.set_xlabel("Measured Per-Layer Time (ms)")
-    ax.set_ylabel("Predicted Per-Layer Time (ms)")
-    ax.set_title("Predicted vs Measured (All Backends)")
-    ax.legend(fontsize=8)
+    ax.set_ylabel("Predicted Time (ms)", labelpad=10)
+    ax.set_title("Predicted vs Measured")
+    ax.legend(fontsize=12, loc='upper left')
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()

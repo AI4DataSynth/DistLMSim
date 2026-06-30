@@ -6,20 +6,23 @@
 - Target model 验证 (K tokens) 时间计算
 - 接受率采样
 - 完整投机周期时间计算
+
+依赖层次: Layer 4
+  输入: config (ModelConfig, DisaggregatedConfig), entities (Request),
+        execution (AnalyticalPredictor), context (SimContext)
+  输出: SpeculativeDecoder (被 simulator 消费)
 """
 
 from __future__ import annotations
 
 import logging
 import random
-from typing import List, TYPE_CHECKING
+from typing import List
 
-from distlmsim.config import ModelConfig, DisaggregatedConfig
+from distlmsim.config import DisaggregatedConfig, ModelConfig
+from distlmsim.context import SimContext
 from distlmsim.entities import Request
 from distlmsim.execution.execution_time_predictor import AnalyticalPredictor
-
-if TYPE_CHECKING:
-    from distlmsim.main import SimContext
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +36,7 @@ class SpeculativeDecoder:
 
     def __init__(
         self,
-        ctx: "SimContext",
+        ctx: SimContext,
         spec_config: DisaggregatedConfig,
         rng: random.Random,
     ):
@@ -156,7 +159,7 @@ class SpeculativeDecoder:
         return draft_time + verify_time, accepted
 
 
-def _apply_overlap(compute_ms: float, comm_ms: float, ctx: "SimContext") -> float:
+def _apply_overlap(compute_ms: float, comm_ms: float, ctx: SimContext) -> float:
     """通信-计算重叠辅助函数。"""
     if comm_ms <= 0:
         return compute_ms

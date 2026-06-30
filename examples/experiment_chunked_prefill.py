@@ -118,6 +118,16 @@ def plot_results(all_results: Dict[int, List[ChunkResult]], output_dir: Path):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    
+    plt.rcParams.update({
+        'font.size': 24,
+        'axes.titlesize': 28,
+        'axes.labelsize': 26,
+        'xtick.labelsize': 22,
+        'ytick.labelsize': 22,
+        'legend.fontsize': 22,
+        'figure.titlesize': 32,
+    })
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
@@ -154,16 +164,16 @@ def plot_results(all_results: Dict[int, List[ChunkResult]], output_dir: Path):
 
     axes[0].set_xlabel("Chunk Size (tokens)")
     axes[0].set_ylabel("TTFT P50 (ms)")
-    axes[0].set_title("Chunked Prefill: TTFT vs Chunk Size")
+    axes[0].set_title("TTFT vs Chunk Size")
     axes[0].set_xscale("log", base=2)
-    axes[0].legend(fontsize=9)
+    axes[0].legend(fontsize=16)
     axes[0].grid(True, alpha=0.3)
 
     axes[1].set_xlabel("Chunk Size (tokens)")
     axes[1].set_ylabel("TBT P50 (ms)")
-    axes[1].set_title("Chunked Prefill: TBT vs Chunk Size")
+    axes[1].set_title("TBT vs Chunk Size")
     axes[1].set_xscale("log", base=2)
-    axes[1].legend(fontsize=9)
+    axes[1].legend(fontsize=16)
     axes[1].grid(True, alpha=0.3)
 
     plt.tight_layout()

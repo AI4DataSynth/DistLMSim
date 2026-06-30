@@ -2,17 +2,19 @@
 
 管理单个副本内的请求排队、批处理和执行调度。
 复用 TRADIOS 的调度器接口设计。
+
+依赖层次: Layer 6
+  输入: entities (Batch, Request, RequestStatus), events (BaseEvent)
+  输出: BaseReplicaScheduler 及其子类 (被 simulator 消费)
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional
+from typing import List, Optional
 
-from distlmsim.entities import Batch, Request
-
-if TYPE_CHECKING:
-    from distlmsim.events import BaseEvent
+from distlmsim.entities import Batch, Request, RequestStatus
+from distlmsim.events import BaseEvent
 
 
 class BaseReplicaScheduler(ABC):
@@ -34,12 +36,12 @@ class BaseReplicaScheduler(ABC):
         self._running_batches: List[Batch] = []
 
     @abstractmethod
-    def on_request_arrival(self, request: Request) -> List["BaseEvent"]:
+    def on_request_arrival(self, request: Request) -> List[BaseEvent]:
         """新请求到达时的处理逻辑。"""
         ...
 
     @abstractmethod
-    def on_batch_end(self, batch_id: int) -> List["BaseEvent"]:
+    def on_batch_end(self, batch_id: int) -> List[BaseEvent]:
         """批处理完成时的处理逻辑。"""
         ...
 
@@ -84,18 +86,86 @@ class SarathiReplicaScheduler(BaseReplicaScheduler):
     ):
         super().__init__(replica_id, max_batch_size, max_num_tokens)
         self._chunk_size = chunk_size
+        self._next_batch_id = 0
 
-    def on_request_arrival(self, request: Request) -> List["BaseEvent"]:
+    def on_request_arrival(self, request: Request) -> List[BaseEvent]:
         self._waiting_queue.append(request)
         return []
 
-    def on_batch_end(self, batch_id: int) -> List["BaseEvent"]:
-        # TODO: 更新 batch 中的请求状态，判断是否完成
+    def on_batch_end(self, batch_id: int) -> List[BaseEvent]:
+        # Remove completed batches
+        completed = []
+        still_running = []
+        for batch in self._running_batches:
+            if batch.id == batch_id:
+                # Update request states
+                for req in batch.requests:
+                    req.num_generated_tokens += 1
+                    if req.num_generated_tokens >= req.decode_tokens:
+                        req.status = RequestStatus.COMPLETED
+                completed.append(batch)
+            else:
+                still_running.append(batch)
+        self._running_batches = still_running
         return []
 
     def form_batch(self, current_time: float) -> Optional[Batch]:
-        # TODO: 实现 chunked prefill + decode 混合批处理
-        raise NotImplementedError("SarathiReplicaScheduler.form_batch")
+        if not self._waiting_queue and not self._running_batches:
+            return None
+
+        batch_requests: List[Request] = []
+        batch_tokens: List[int] = []
+        total_tokens = 0
+
+        # 1. Add decode requests from running batches (iteration-level scheduling)
+        for batch in self._running_batches:
+            for req in batch.requests:
+                if req.status != RequestStatus.COMPLETED:
+                    batch_requests.append(req)
+                    batch_tokens.append(1)  # 1 decode token per request
+                    total_tokens += 1
+
+        # 2. Fill remaining token budget with prefill chunks from waiting queue
+        remaining_budget = self._max_num_tokens - total_tokens
+        prefill_requests = []
+        while self._waiting_queue and remaining_budget > 0:
+            req = self._waiting_queue[0]
+            tokens_needed = req.prefill_tokens - (
+                req.num_generated_tokens if req.prefill_end_time is None else 0
+            )
+            chunk = min(self._chunk_size, tokens_needed, remaining_budget)
+            if chunk <= 0:
+                self._waiting_queue.pop(0)
+                continue
+            prefill_requests.append((req, chunk))
+            remaining_budget -= chunk
+            if chunk >= tokens_needed:
+                self._waiting_queue.pop(0)
+            else:
+                # Partial chunk - keep in queue for next iteration
+                req.num_generated_tokens += chunk
+                break
+
+        for req, chunk in prefill_requests:
+            batch_requests.append(req)
+            batch_tokens.append(chunk)
+
+        if not batch_requests:
+            return None
+
+        batch_id = self._next_batch_id
+        self._next_batch_id += 1
+
+        batch = Batch(
+            id=batch_id,
+            replica_id=self._replica_id,
+            requests=batch_requests,
+            num_tokens=batch_tokens,
+            creation_time=current_time,
+            is_prefill_batch=len(prefill_requests) > 0,
+        )
+        self._running_batches.append(batch)
+        return batch
 
 
 class VllmReplicaScheduler(BaseReplicaScheduler):
@@ -114,11 +184,11 @@ class VllmReplicaScheduler(BaseReplicaScheduler):
         super().__init__(replica_id, max_batch_size, max_num_tokens)
         self._block_size = block_size
 
-    def on_request_arrival(self, request: Request) -> List["BaseEvent"]:
+    def on_request_arrival(self, request: Request) -> List[BaseEvent]:
         self._waiting_queue.append(request)
         return []
 
-    def on_batch_end(self, batch_id: int) -> List["BaseEvent"]:
+    def on_batch_end(self, batch_id: int) -> List[BaseEvent]:
         return []
 
     def form_batch(self, current_time: float) -> Optional[Batch]:
@@ -128,11 +198,11 @@ class VllmReplicaScheduler(BaseReplicaScheduler):
 class OrcaReplicaScheduler(BaseReplicaScheduler):
     """Orca 调度器。迭代级调度，每步形成 batch。"""
 
-    def on_request_arrival(self, request: Request) -> List["BaseEvent"]:
+    def on_request_arrival(self, request: Request) -> List[BaseEvent]:
         self._waiting_queue.append(request)
         return []
 
-    def on_batch_end(self, batch_id: int) -> List["BaseEvent"]:
+    def on_batch_end(self, batch_id: int) -> List[BaseEvent]:
         return []
 
     def form_batch(self, current_time: float) -> Optional[Batch]:

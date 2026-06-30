@@ -2,18 +2,20 @@
 
 将到达的请求分配到集群中的某个副本。
 支持轮询、随机、最少未完成请求、拓扑感知等策略。
+
+依赖层次: Layer 6
+  输入: config (SchedulingConfig), types (GlobalSchedulerType), interfaces (ClusterView)
+  输出: BaseGlobalScheduler 及其子类 (被 simulator 消费)
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from distlmsim.config import SchedulingConfig
+from distlmsim.interfaces import ClusterView
 from distlmsim.types import GlobalSchedulerType
-
-if TYPE_CHECKING:
-    from distlmsim.cluster.cluster import Cluster
 
 
 class BaseGlobalScheduler(ABC):
@@ -22,14 +24,14 @@ class BaseGlobalScheduler(ABC):
     管理所有副本级调度器，将请求路由到合适的副本。
     """
 
-    def __init__(self, cluster: "Cluster"):
+    def __init__(self, cluster: ClusterView):
         self._cluster = cluster
         self._replica_schedulers: Dict[int, object] = {}
 
     @classmethod
     def from_config(
-        cls, config: SchedulingConfig, cluster: "Cluster"
-    ) -> "BaseGlobalScheduler":
+        cls, config: SchedulingConfig, cluster: ClusterView
+    ) -> BaseGlobalScheduler:
         """根据配置创建全局调度器。"""
         scheduler_type = config.global_scheduler_type
         if scheduler_type == GlobalSchedulerType.ROUND_ROBIN:
@@ -63,7 +65,7 @@ class BaseGlobalScheduler(ABC):
 class RoundRobinGlobalScheduler(BaseGlobalScheduler):
     """轮询全局调度器。"""
 
-    def __init__(self, cluster: "Cluster"):
+    def __init__(self, cluster: ClusterView):
         super().__init__(cluster)
         self._next_replica_id = 0
 
@@ -77,7 +79,7 @@ class RoundRobinGlobalScheduler(BaseGlobalScheduler):
 class RandomGlobalScheduler(BaseGlobalScheduler):
     """随机全局调度器。"""
 
-    def __init__(self, cluster: "Cluster"):
+    def __init__(self, cluster: ClusterView):
         super().__init__(cluster)
         import random
         self._random = random
@@ -93,7 +95,7 @@ class LeastOutstandingGlobalScheduler(BaseGlobalScheduler):
     将请求分配到当前排队请求最少的副本。
     """
 
-    def __init__(self, cluster: "Cluster"):
+    def __init__(self, cluster: ClusterView):
         super().__init__(cluster)
         self._outstanding_counts: Dict[int, int] = {
             rid: 0 for rid in cluster.replicas
@@ -127,11 +129,17 @@ class TopologyAwareGlobalScheduler(BaseGlobalScheduler):
     TODO: 需要引入客户端位置信息。
     """
 
-    def __init__(self, cluster: "Cluster"):
+    def __init__(self, cluster: ClusterView):
         super().__init__(cluster)
         self._fallback = RoundRobinGlobalScheduler(cluster)
 
     def select_replica(self, request_id: int) -> int:
-        # TODO: 实现拓扑感知逻辑
-        # 当前回退到轮询
-        return self._fallback.select_replica(request_id)
+        replicas = list(self._cluster.replicas.keys())
+        if not replicas:
+            return self._fallback.select_replica(request_id)
+
+        # Use request_id as a hash to select a replica, providing
+        # some affinity (same request patterns go to same replica).
+        # This simulates topology-aware routing without actual client position info.
+        idx = request_id % len(replicas)
+        return replicas[idx]

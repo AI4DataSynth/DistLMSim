@@ -116,10 +116,22 @@ def run_single_config(
 
 def plot_results(results: List[Dict], output_dir: Path):
     """绘制对比图表。"""
+    import matplotlib.pyplot as plt
+    
+    plt.rcParams.update({
+        'font.size': 24,
+        'axes.titlesize': 28,
+        'axes.labelsize': 26,
+        'xtick.labelsize': 22,
+        'ytick.labelsize': 22,
+        'legend.fontsize': 22,
+        'figure.titlesize': 32,
+    })
+    
     qps_list = [r["qps"] for r in results]
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle("PD Disaggregated vs Colocated Deployment", fontsize=16)
+    fig.suptitle("PD Disaggregated vs Colocated Deployment", fontsize=24)
 
     metrics = [
         ("ttft_p50", "TTFT P50 (ms)", axes[0, 0]),
@@ -144,7 +156,7 @@ def plot_results(results: List[Dict], output_dir: Path):
         ax.set_ylabel(ylabel)
         ax.set_title(ylabel)
         ax.set_xticks(x)
-        ax.set_xticklabels(qps_list)
+        ax.set_xticklabels(qps_list, rotation=45, ha='right')
         ax.legend()
         ax.grid(True, alpha=0.3, axis='y')
 

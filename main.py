@@ -3,6 +3,10 @@
 提供两种运行方式：
 1. DisaggregatedSimulator: 存算分离模式的完整模拟 (推荐入门)
 2. DistributedInferenceSimulator: 通用分布式模拟 (事件驱动)
+
+依赖层次: Layer 7 (顶层组装)
+  输入: 所有下层模块
+  输出: DisaggregatedSimulator, DistributedInferenceSimulator
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ from distlmsim.config import (
     RequestGeneratorConfig,
     MetricsConfig,
 )
+from distlmsim.context import SimContext
 from distlmsim.entities import Request, RequestStatus, ExecutionTime
 from distlmsim.execution.execution_time_predictor import (
     AnalyticalPredictor,
@@ -43,52 +48,7 @@ from distlmsim.scheduling.advanced_schedulers import AdvancedSchedulers
 logger = logging.getLogger(__name__)
 
 
-# ─── 模拟上下文 ──────────────────────────────────────────────────────────────
-
-
-@dataclass
-class SimContext:
-    """模拟运行时上下文，持有所有共享状态。"""
-    model_config: ModelConfig
-    device_config: DeviceSKUConfig
-    network_config: NetworkTopologyConfig
-    # 通信模型
-    nvlink_model: NVLinkModel = field(default=None)
-    rdma_model: RDMAModel = field(default=None)
-    # 通信-计算重叠模型 (论文 §3.6: 3D Timeline)
-    overlap_processor: OverlapProcessor = field(default=None)
-    # 执行时间预测
-    time_predictor: ExecutionTimePredictor = field(default=None)
-    # 请求池
-    requests: Dict[int, Request] = field(default_factory=dict)
-    # 指标
-    metrics_store: MetricsStore = field(default=None)
-    # 集群参数
-    num_gpus_per_node: int = 4
-    prefill_node_id: int = 0
-    decode_node_id: int = 1
-    tp_size: int = 4
-    # Profiling 配置
-    profiling_dir: Optional[str] = None
-    predictor_type: str = "auto"  # "auto", "analytical", "profiled", "random_forest"
-
-    def __post_init__(self):
-        if self.nvlink_model is None:
-            self.nvlink_model = NVLinkModel(
-                self.network_config.nvlink, self.num_gpus_per_node
-            )
-        if self.rdma_model is None:
-            self.rdma_model = RDMAModel(
-                self.network_config.rdma,
-                congestion_alpha=self.network_config.rdma.congestion_alpha,
-            )
-        if self.overlap_processor is None:
-            self.overlap_processor = OverlapProcessor(OverlapConfig())
-        if self.time_predictor is None:
-            self.time_predictor = create_predictor(
-                self.model_config, self.device_config,
-                self.profiling_dir, self.predictor_type
-            )
+# SimContext 已从 distlmsim.context 导入 (消除循环依赖)
 
 
 # ─── 存算分离模拟器 ────────────────────────────────────────────────────────────

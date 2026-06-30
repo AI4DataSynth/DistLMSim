@@ -272,6 +272,7 @@ def main():
 
         if len(seeds) == 1:
             print_table(results)
+            plot_scheduling_results(results)
 
     # 多种子汇总
     if len(seeds) > 1:
@@ -296,6 +297,16 @@ def plot_scheduling_results(results):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from pathlib import Path
+    
+    plt.rcParams.update({
+        'font.size': 24,
+        'axes.titlesize': 28,
+        'axes.labelsize': 26,
+        'xtick.labelsize': 22,
+        'ytick.labelsize': 22,
+        'legend.fontsize': 22,
+        'figure.titlesize': 32,
+    })
 
     names = [r.scheduler_name for r in results]
     ttft_p50 = [r.ttft_p50 for r in results]
@@ -326,10 +337,36 @@ def plot_scheduling_results(results):
         marker = "o" if r.scheduler_key not in ("sjf", "po") else "*"
         color = "#2ecc71" if r.scheduler_key == "po" else ("#e74c3c" if r.scheduler_key == "sjf" else "#3498db")
         ax.scatter(r.ttft_mean, r.e2e_mean, s=100, marker=marker, c=color, zorder=5)
-        ax.annotate(r.scheduler_key.upper(), (r.ttft_mean, r.e2e_mean), fontsize=8, ha="left")
+
+    # Only annotate the most extreme points to avoid label overlap
+    if results:
+        ttft_vals = [(r.scheduler_key.upper(), r.ttft_mean, r.e2e_mean) for r in results]
+        best_ttft = min(ttft_vals, key=lambda t: t[1])
+        worst_ttft = max(ttft_vals, key=lambda t: t[1])
+        best_e2e = min(ttft_vals, key=lambda t: t[2])
+        worst_e2e = max(ttft_vals, key=lambda t: t[2])
+        extreme_keys = {best_ttft[0], worst_ttft[0], best_e2e[0], worst_e2e[0]}
+
+        # Compute centroid for dynamic label placement
+        cx = sum(r.ttft_mean for r in results) / len(results)
+        cy = sum(r.e2e_mean for r in results) / len(results)
+
+        for r in results:
+            label = r.scheduler_key.upper()
+            if label in extreme_keys:
+                # Offset label away from centroid
+                dx = r.ttft_mean - cx
+                dy = r.e2e_mean - cy
+                off_x = -12 if dx >= 0 else 12
+                off_y = 10 if dy >= 0 else -10
+                ha_val = "right" if dx >= 0 else "left"
+                va_val = "bottom" if dy >= 0 else "top"
+                ax.annotate(label, (r.ttft_mean, r.e2e_mean), fontsize=10,
+                            ha=ha_val, va=va_val,
+                            xytext=(off_x, off_y), textcoords="offset points")
     ax.set_xlabel("TTFT Mean (ms)")
     ax.set_ylabel("E2E Mean (ms)")
-    ax.set_title("Trade-off: TTFT Mean vs E2E Mean")
+    ax.set_title("TTFT vs E2E")
 
     # Composite score
     ax = axes[1, 1]
@@ -341,7 +378,7 @@ def plot_scheduling_results(results):
     colors2 = ["#2ecc71" if i == best_idx else "#95a5a6" for i in range(len(results))]
     ax.barh(names, scores, color=colors2)
     ax.set_xlabel("Composite Score")
-    ax.set_title(f"Composite Scheduler Score (Best: {results[best_idx].scheduler_key.upper()})")
+    ax.set_title("Scheduler Score")
 
     plt.tight_layout()
     out_dir = Path("results")

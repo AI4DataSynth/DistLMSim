@@ -164,6 +164,16 @@ def plot_results(results, prefill_lengths, qps_values, output_dir):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    
+    plt.rcParams.update({
+        'font.size': 14,
+        'axes.titlesize': 14,
+        'axes.labelsize': 14,
+        'xtick.labelsize': 11,
+        'ytick.labelsize': 11,
+        'legend.fontsize': 10,
+        'figure.titlesize': 16,
+    })
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
 
@@ -184,8 +194,7 @@ def plot_results(results, prefill_lengths, qps_values, output_dir):
 
     axes[0].set_xlabel("QPS (requests/sec)")
     axes[0].set_ylabel("TTFT P50 (ms)")
-    axes[0].set_title("KV Transfer Strategy: TTFT vs QPS")
-    axes[0].legend(fontsize=7, ncol=3)
+    axes[0].set_title("TTFT vs QPS")
     axes[0].grid(True, alpha=0.3)
 
     # E2E P50 vs prefill_length (at middle QPS)
@@ -201,8 +210,7 @@ def plot_results(results, prefill_lengths, qps_values, output_dir):
 
     axes[1].set_xlabel("Prefill Length (tokens)")
     axes[1].set_ylabel("E2E P50 (ms)")
-    axes[1].set_title(f"KV Transfer Strategy: E2E vs Prefill Length (QPS={mid_qps:.0f})")
-    axes[1].legend(fontsize=9)
+    axes[1].set_title("E2E Latency")
     axes[1].grid(True, alpha=0.3)
 
     # Decode throughput comparison
@@ -216,12 +224,15 @@ def plot_results(results, prefill_lengths, qps_values, output_dir):
                 label=strat_name, markersize=8)
 
     axes[2].set_xlabel("Prefill Length (tokens)")
-    axes[2].set_ylabel("Decode Throughput (tok/s)")
-    axes[2].set_title(f"KV Transfer Strategy: Throughput vs Prefill Length (QPS={mid_qps:.0f})")
-    axes[2].legend(fontsize=9)
+    axes[2].set_ylabel("Decode Tput (tok/s)")
+    axes[2].set_title("Throughput")
     axes[2].grid(True, alpha=0.3)
 
-    plt.tight_layout()
+    # Single shared legend below all plots
+    handles, labels = axes[1].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='lower center', ncol=3, fontsize=12,
+               bbox_to_anchor=(0.5, -0.05))
+    plt.tight_layout(rect=[0, 0.08, 1, 1])
     plt.savefig(output_dir / "kv_transfer_strategies.png", dpi=300, bbox_inches="tight")
     plt.savefig(output_dir / "kv_transfer_strategies.pdf", bbox_inches="tight")
     print(f"\n图表已保存: {output_dir / 'kv_transfer_strategies.pdf'}")

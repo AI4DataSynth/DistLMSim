@@ -99,16 +99,27 @@ class NetworkTopology:
         考虑路径上所有链路的最小带宽和收敛比。
         """
         if src_node == dst_node:
-            # 同节点走 NVLink
             return self._config.nvlink.nvswitch_bandwidth_gbps
-        # TODO: 计算跨节点路径带宽
-        return self._config.rdma.bandwidth_gbps
+
+        path = self.get_path(src_node, dst_node)
+        if not path:
+            return self._config.rdma.bandwidth_gbps
+
+        # Effective bandwidth = min bandwidth along the path
+        min_bw = min(link.bandwidth_gbps for link in path)
+
+        # Apply oversubscription ratio
+        effective_bw = min_bw / max(self._config.oversubscription_ratio, 1.0)
+        return effective_bw
 
     def get_latency(self, src_node: int, dst_node: int) -> float:
         """获取两节点间的总延迟 (微秒)。"""
         if src_node == dst_node:
             return self._config.nvlink.latency_us
-        return self._config.rdma.latency_us
+        path = self.get_path(src_node, dst_node)
+        if not path:
+            return self._config.rdma.latency_us
+        return sum(link.latency_us for link in path)
 
     def is_same_node(self, gpu_id_a: int, gpu_id_b: int, gpus_per_node: int) -> bool:
         """判断两个 GPU 是否在同一节点内。"""

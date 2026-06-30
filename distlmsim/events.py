@@ -1,19 +1,20 @@
 """DistLMSim 事件系统
 
 离散事件模拟的核心：每个事件在 handle_event() 中处理自身逻辑并返回后续事件列表。
+
+依赖层次: Layer 2
+  输入: types (EventType), interfaces (ReplicaSelector, MetricsRecorder)
+  输出: BaseEvent 及其子类 (被 simulator 和 scheduling 消费)
 """
 
 from __future__ import annotations
 
 import itertools
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional
+from typing import List, Optional
 
+from distlmsim.interfaces import MetricsRecorder, ReplicaSelector
 from distlmsim.types import EventType
-
-if TYPE_CHECKING:
-    from distlmsim.metrics.metrics_store import MetricsStore
-    from distlmsim.scheduling.global_scheduler import BaseGlobalScheduler
 
 
 _event_id_counter = itertools.count()
@@ -46,9 +47,9 @@ class BaseEvent(ABC):
     @abstractmethod
     def handle_event(
         self,
-        scheduler: "BaseGlobalScheduler",
-        metrics_store: "MetricsStore",
-    ) -> List["BaseEvent"]:
+        scheduler: ReplicaSelector,
+        metrics_store: MetricsRecorder,
+    ) -> List[BaseEvent]:
         """处理事件，返回后续事件列表。"""
         ...
 
@@ -75,8 +76,8 @@ class RequestArrivalEvent(BaseEvent):
 
     def handle_event(
         self,
-        scheduler: "BaseGlobalScheduler",
-        metrics_store: "MetricsStore",
+        scheduler: ReplicaSelector,
+        metrics_store: MetricsRecorder,
     ) -> List[BaseEvent]:
         metrics_store.record_request_arrival(self._request_id, self._time)
         return [GlobalScheduleEvent(self._time, self._request_id)]
@@ -91,8 +92,8 @@ class GlobalScheduleEvent(BaseEvent):
 
     def handle_event(
         self,
-        scheduler: "BaseGlobalScheduler",
-        metrics_store: "MetricsStore",
+        scheduler: ReplicaSelector,
+        metrics_store: MetricsRecorder,
     ) -> List[BaseEvent]:
         replica_id = scheduler.select_replica(self._request_id)
         return [ReplicaScheduleEvent(self._time, self._request_id, replica_id)]
@@ -108,8 +109,8 @@ class ReplicaScheduleEvent(BaseEvent):
 
     def handle_event(
         self,
-        scheduler: "BaseGlobalScheduler",
-        metrics_store: "MetricsStore",
+        scheduler: ReplicaSelector,
+        metrics_store: MetricsRecorder,
     ) -> List[BaseEvent]:
         """副本级调度：将请求加入副本的批处理队列。
 
@@ -123,23 +124,28 @@ class ReplicaScheduleEvent(BaseEvent):
 class BatchStageArrivalEvent(BaseEvent):
     """批处理到达某个 pipeline stage。"""
 
-    def __init__(self, time: float, batch_id: int, stage_id: int, replica_id: int):
+    def __init__(self, time: float, batch_id: int, stage_id: int, replica_id: int,
+                 pp_comm_time_ms: float = 0.0, stages_per_node: int = 1):
         super().__init__(time, EventType.BATCH_STAGE_ARRIVAL)
         self._batch_id = batch_id
         self._stage_id = stage_id
         self._replica_id = replica_id
+        self._pp_comm_time_ms = pp_comm_time_ms
+        self._stages_per_node = stages_per_node
 
     def handle_event(
         self,
-        scheduler: "BaseGlobalScheduler",
-        metrics_store: "MetricsStore",
+        scheduler: ReplicaSelector,
+        metrics_store: MetricsRecorder,
     ) -> List[BaseEvent]:
         # Future: 计算执行时间，生成 BatchStageEndEvent
         # 当前 main.py 使用自己的仿真循环处理 pipeline stage 执行
         return [
             BatchStageEndEvent(
                 self._time, self._batch_id, self._stage_id,
-                self._replica_id, num_stages=1  # 默认单 stage
+                self._replica_id, num_stages=1,  # 默认单 stage
+                pp_comm_time_ms=self._pp_comm_time_ms,
+                stages_per_node=self._stages_per_node,
             )
         ]
 
@@ -148,26 +154,40 @@ class BatchStageEndEvent(BaseEvent):
     """Pipeline stage 执行完成。"""
 
     def __init__(self, time: float, batch_id: int, stage_id: int, replica_id: int,
-                 num_stages: int):
+                 num_stages: int,
+                 pp_comm_time_ms: float = 0.0, stages_per_node: int = 1):
         super().__init__(time, EventType.BATCH_STAGE_END)
         self._batch_id = batch_id
         self._stage_id = stage_id
         self._replica_id = replica_id
         self._num_stages = num_stages
+        self._pp_comm_time_ms = pp_comm_time_ms
+        self._stages_per_node = stages_per_node
 
     def handle_event(
         self,
-        scheduler: "BaseGlobalScheduler",
-        metrics_store: "MetricsStore",
+        scheduler: ReplicaSelector,
+        metrics_store: MetricsRecorder,
     ) -> List[BaseEvent]:
         if self._stage_id < self._num_stages - 1:
             # 还有下一个 stage → PP 通信 → 下一个 stage
-            # TODO: 计算 PP 通信时间 (可能跨节点 RDMA)
-            next_stage_time = self._time  # + pp_comm_time
+            # 判断是否跨节点：根据 stage_id 和 stages_per_node 推算
+            current_node = self._stage_id // self._stages_per_node
+            next_node = (self._stage_id + 1) // self._stages_per_node
+            is_cross_node = current_node != next_node
+
+            if is_cross_node and self._pp_comm_time_ms > 0:
+                pp_delay = self._pp_comm_time_ms
+            else:
+                pp_delay = 0.0  # 同节点 NVLink 延迟可忽略
+
+            next_stage_time = self._time + pp_delay
             return [
                 BatchStageArrivalEvent(
                     next_stage_time, self._batch_id,
-                    self._stage_id + 1, self._replica_id
+                    self._stage_id + 1, self._replica_id,
+                    pp_comm_time_ms=self._pp_comm_time_ms,
+                    stages_per_node=self._stages_per_node,
                 )
             ]
         else:
@@ -185,8 +205,8 @@ class BatchEndEvent(BaseEvent):
 
     def handle_event(
         self,
-        scheduler: "BaseGlobalScheduler",
-        metrics_store: "MetricsStore",
+        scheduler: ReplicaSelector,
+        metrics_store: MetricsRecorder,
     ) -> List[BaseEvent]:
         # Future: 更新请求状态，判断是否继续 decode 或完成
         # 当前 main.py 使用自己的仿真循环处理 batch 完成逻辑
@@ -211,8 +231,8 @@ class PrefillCompleteEvent(BaseEvent):
 
     def handle_event(
         self,
-        scheduler: "BaseGlobalScheduler",
-        metrics_store: "MetricsStore",
+        scheduler: ReplicaSelector,
+        metrics_store: MetricsRecorder,
     ) -> List[BaseEvent]:
         # 触发 KV Cache 传输
         return [
@@ -235,8 +255,8 @@ class KVCacheTransferStartEvent(BaseEvent):
 
     def handle_event(
         self,
-        scheduler: "BaseGlobalScheduler",
-        metrics_store: "MetricsStore",
+        scheduler: ReplicaSelector,
+        metrics_store: MetricsRecorder,
     ) -> List[BaseEvent]:
         """通过 RDMA 模型计算 KV Cache 传输时间。
 
@@ -273,8 +293,8 @@ class KVCacheTransferEndEvent(BaseEvent):
 
     def handle_event(
         self,
-        scheduler: "BaseGlobalScheduler",
-        metrics_store: "MetricsStore",
+        scheduler: ReplicaSelector,
+        metrics_store: MetricsRecorder,
     ) -> List[BaseEvent]:
         metrics_store.record_kv_cache_transfer_end(self._request_id, self._time)
         # 传输完成，开始在 Decode 节点上调度 decode
@@ -290,8 +310,8 @@ class DecodeStartEvent(BaseEvent):
 
     def handle_event(
         self,
-        scheduler: "BaseGlobalScheduler",
-        metrics_store: "MetricsStore",
+        scheduler: ReplicaSelector,
+        metrics_store: MetricsRecorder,
     ) -> List[BaseEvent]:
         # Future: 将请求分配到 Decode 节点的副本
         # 当前 main.py 使用自己的仿真循环处理 decode 调度
@@ -312,8 +332,8 @@ class ExpertAssignmentEvent(BaseEvent):
 
     def handle_event(
         self,
-        scheduler: "BaseGlobalScheduler",
-        metrics_store: "MetricsStore",
+        scheduler: ReplicaSelector,
+        metrics_store: MetricsRecorder,
     ) -> List[BaseEvent]:
         # Future: 执行 Top-K 路由 + 负载均衡，生成 ExpertCommStartEvent
         # 当前 main.py 通过 _compute_moe_imbalance_factor() 处理 MoE 路由
@@ -330,8 +350,8 @@ class ExpertCommStartEvent(BaseEvent):
 
     def handle_event(
         self,
-        scheduler: "BaseGlobalScheduler",
-        metrics_store: "MetricsStore",
+        scheduler: ReplicaSelector,
+        metrics_store: MetricsRecorder,
     ) -> List[BaseEvent]:
         # Future: 通过 RDMA 模型计算 all-to-all 通信时间
         # 当前 main.py 通过 expert_parallel_comm_time 处理 EP 通信
@@ -356,8 +376,8 @@ class ExpertCommEndEvent(BaseEvent):
 
     def handle_event(
         self,
-        scheduler: "BaseGlobalScheduler",
-        metrics_store: "MetricsStore",
+        scheduler: ReplicaSelector,
+        metrics_store: MetricsRecorder,
     ) -> List[BaseEvent]:
         # Future: 通信完成，继续后续 pipeline stage
         # 当前 main.py 使用自己的仿真循环处理后续流程
