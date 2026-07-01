@@ -178,7 +178,39 @@ Run scheduler comparison experiment:
 python3 examples/experiment_schedulers.py --qps 20 --time_limit 30
 ```
 
-### 6. MoE Expert Load Balancing
+### 6. DSpark / DFlash Speculative Decoding (DeepSeek)
+
+DistLMSim supports DeepSeek's DSpark and DFlash speculative decoding schemes
+([DeepSpec](https://github.com/deepseek-ai/DeepSpec)):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `speculative_mode` | `"standard"` | `"standard"` / `"dspark"` / `"dflash"` |
+| `block_size` | 7 | Tokens drafted per speculation round |
+| `markov_rank` | 256 | Low-rank dimension for Markov head |
+| `markov_head_type` | `"vanilla"` | `"vanilla"` / `"gated"` / `"rnn"` |
+| `num_target_layer_ids` | 5 | Target model layers tapped for features |
+| `confidence_threshold` | 0.0 | Early stopping threshold (0=disabled) |
+| `enable_confidence_scheduling` | `false` | Load-aware confidence scheduling |
+| `draft_num_layers` | 5 | Draft model transformer layers |
+| `draft_embedding_dim` | 512 | Draft model hidden dimension |
+| `acceptance_rate` | 0.8 | Average token acceptance rate (0-1) |
+
+**DSpark** uses semi-autoregressive drafting with Markov heads:
+- Block-based: generates `block_size` tokens per round
+- Markov head models token-to-token dependency via low-rank embedding (vocab→rank→vocab)
+- Taps into target model's intermediate layers for feature extraction
+- Confidence scheduling enables early stopping for low-confidence blocks
+
+**DFlash** extends DSpark with parallel block drafting and draft-verify pipelining.
+
+Run speculative decoding experiment:
+
+```bash
+python3 examples/experiment_speculative_decoding.py
+```
+
+### 7. MoE Expert Load Balancing
 
 For Mixture-of-Experts (MoE) models, DistLMSim supports 4 expert load balancing strategies:
 
@@ -295,7 +327,7 @@ python3 -m unittest tests/test_e2e.py -v
 | Communication-computation overlap | ✅ Complete | Ratio-based + bandwidth-aware |
 | Roofline execution time predictor | ✅ Complete | Compute/memory-bound modeling |
 | Hybrid backend (Profiled + RF) | ✅ Complete | Linear regression + RandomForest |
-| Speculative decoding modeling | ✅ Complete | Draft + verify + acceptance sampling |
+| Speculative decoding modeling | ✅ Complete | Standard + DSpark/DFlash (DeepSeek) |
 | Sarathi replica scheduler | ✅ Complete | Chunked prefill + decode mixing |
 | vLLM replica scheduler | ✅ Complete | PagedAttention block mgmt + preemption |
 | Orca replica scheduler | ✅ Complete | Iteration-level, full prefill batching |

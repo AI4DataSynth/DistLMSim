@@ -161,6 +161,14 @@ class DisaggregatedConfig:
     # Draft model: 用较小的模型参数近似 (层数少 = 计算快)
     draft_num_layers: int = 4           # Draft model 层数 (target 48)
     draft_embedding_dim: int = 512      # Draft model 隐藏维度 (target 2048)
+    # DSpark / DFlash 配置 (DeepSeek 投机解码方案)
+    speculative_mode: str = "standard"  # "standard" | "dspark" | "dflash"
+    block_size: int = 7                 # DSpark: 每轮起草的 token 块大小
+    markov_rank: int = 256              # DSpark: Markov head 低秩维度
+    markov_head_type: str = "vanilla"   # "vanilla" | "gated" | "rnn"
+    num_target_layer_ids: int = 5       # DSpark: 从目标模型抽取的中间层数
+    confidence_threshold: float = 0.0   # DSpark: 置信度早停阈值 (0=不启用)
+    enable_confidence_scheduling: bool = False  # DSpark: 负载感知置信度调度
     # MoE Expert Load Imbalance
     moe_expert_load_zipf_alpha: float = 1.0  # Zipf α 控制 token→expert 分布偏斜度
                                               # 1.0 = 均匀, >1.0 = 偏斜
