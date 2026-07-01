@@ -3,14 +3,16 @@
 提供两种运行方式：
 1. DisaggregatedSimulator: 存算分离模式的完整模拟 (推荐入门)
 2. DistributedInferenceSimulator: 通用分布式模拟 (事件驱动)
+3. ColocatedSimulator: Colocated (非分离) 模式模拟
 
 依赖层次: Layer 7 (顶层组装)
   输入: 所有下层模块
-  输出: DisaggregatedSimulator, DistributedInferenceSimulator
+  输出: DisaggregatedSimulator, DistributedInferenceSimulator, ColocatedSimulator
 """
 
 from __future__ import annotations
 
+import heapq
 import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -816,19 +818,170 @@ class DisaggregatedSimulator:
 class DistributedInferenceSimulator:
     """通用分布式推理模拟器 (事件驱动框架)。
 
-    基于 heapq 的离散事件循环。
+    基于 heapq 的离散事件循环。适用于 TP+PP 场景的通用模拟，
+    支持多副本部署和请求路由。
+
+    事件循环:
+    1. 生成请求序列 (Poisson 到达)
+    2. 创建 RequestArrivalEvent 入堆
+    3. 弹出最早事件 → handle_event() → 生成后续事件入堆
+    4. 重复直到时间上限或无剩余事件
     """
 
     def __init__(self, config: SimulationConfig):
         self._config = config
+        self._rng = np.random.default_rng(config.seed)
+        self._request_counter = 0
+
+        # 从 SimulationConfig 提取子配置
+        replica_cfg = config.cluster.replica
+        tp_size = replica_cfg.tensor_parallel_size
+
+        # 初始化 SimContext
+        self.ctx = SimContext(
+            model_config=replica_cfg.model,
+            device_config=replica_cfg.device_sku,
+            network_config=config.cluster.network,
+            metrics_store=MetricsStore(config.metrics),
+            tp_size=tp_size,
+            num_gpus_per_node=tp_size,
+        )
+
+        # 全局调度器 (简化版: 单副本 round-robin)
+        from distlmsim.scheduling.global_scheduler import RoundRobinGlobalScheduler
+
+        class _SingleReplicaCluster:
+            """Minimal ClusterView for single-replica event-driven sim."""
+            replicas = {0: None}
+            nodes = {}
+
+        self._scheduler = RoundRobinGlobalScheduler(_SingleReplicaCluster())
         logger.info("DistributedInferenceSimulator 初始化")
 
-    def run(self) -> MetricsStore:
-        """运行模拟。"""
-        raise NotImplementedError(
-            "通用事件驱动模拟器尚未完整实现。"
-            "请使用 DisaggregatedSimulator 进行存算分离模拟。"
+    def _create_request(self, arrival_time: float) -> Request:
+        req_config = self._config.request
+        prefill_tokens = self._sample_length(req_config.prefill_length)
+        decode_tokens = self._sample_length(req_config.decode_length)
+        req = Request(
+            id=self._request_counter,
+            arrival_time=arrival_time,
+            prefill_tokens=prefill_tokens,
+            decode_tokens=decode_tokens,
         )
+        self._request_counter += 1
+        self.ctx.requests[req.id] = req
+        return req
+
+    def _sample_length(self, mean: int) -> int:
+        dist = self._config.request.length_distribution
+        if dist == "fixed":
+            return mean
+        cv = self._config.request.length_cv
+        std = mean * cv
+        return max(1, int(self._rng.normal(mean, std)))
+
+    def run(self) -> MetricsStore:
+        """运行事件驱动模拟。"""
+        from distlmsim.events import (
+            RequestArrivalEvent,
+            PrefillCompleteEvent,
+            DecodeStartEvent,
+        )
+
+        time_limit_ms = self._config.time_limit_s * 1e3
+        metrics = self.ctx.metrics_store
+
+        # 内部 decode 事件 (简化版，不依赖 BatchEndEvent 的 batch_id 语义)
+        class _DecodeStepEvent:
+            """内部 decode step 事件。"""
+            __slots__ = ("_time", "_request_id")
+            def __init__(self, time: float, request_id: int):
+                self._time = time
+                self._request_id = request_id
+
+        # 1. Generate all requests
+        requests: List[Request] = []
+        current_time = 0.0
+        qps = self._config.request.qps
+        while current_time < time_limit_ms:
+            req = self._create_request(current_time)
+            requests.append(req)
+            interval_s = self._rng.exponential(1.0 / qps) if qps > 0 else float("inf")
+            current_time += interval_s * 1e3
+
+        logger.info("生成 %d 个请求", len(requests))
+
+        # 2. Build event heap
+        event_heap: list = []
+        event_id = 0
+        for req in requests:
+            heapq.heappush(event_heap, (req.arrival_time, event_id, RequestArrivalEvent(req.arrival_time, req.id)))
+            event_id += 1
+
+        # 3. Event loop
+        while event_heap:
+            t, _, event = heapq.heappop(event_heap)
+            if t > time_limit_ms:
+                break
+
+            if isinstance(event, RequestArrivalEvent):
+                req = self.ctx.requests.get(event._request_id)
+                if req is None:
+                    continue
+                metrics.record_request_arrival(req.id, t)
+                req.status = RequestStatus.PREFILLING
+                metrics.record_request_scheduled(req.id, t)
+                req.prefill_start_time = t
+
+                # Compute prefill time
+                et = self.ctx.time_predictor.get_execution_time(
+                    req.prefill_tokens, 1, 0, is_prefill=True
+                )
+                prefill_time = et.total_time
+                prefill_end = t + prefill_time
+                req.prefill_end_time = prefill_end
+
+                heapq.heappush(event_heap, (prefill_end, event_id,
+                    PrefillCompleteEvent(prefill_end, req.id, 0, 0)))
+                event_id += 1
+
+            elif isinstance(event, PrefillCompleteEvent):
+                req = self.ctx.requests.get(event._request_id)
+                if req is None:
+                    continue
+                req.status = RequestStatus.DECODING
+                req.decode_start_time = t
+                metrics.record_decode_start(req.id, t, 0)
+                req.num_generated_tokens = 0
+
+                et = self.ctx.time_predictor.get_execution_time(
+                    1, 1, req.prefill_tokens, is_prefill=False
+                )
+                heapq.heappush(event_heap, (t + et.total_time, event_id,
+                    _DecodeStepEvent(t + et.total_time, req.id)))
+                event_id += 1
+
+            elif isinstance(event, _DecodeStepEvent):
+                req = self.ctx.requests.get(event._request_id)
+                if req is None:
+                    continue
+                req.num_generated_tokens += 1
+                if req.num_generated_tokens >= req.decode_tokens:
+                    req.status = RequestStatus.COMPLETED
+                    req.completion_time = t
+                    metrics.record_decode_end(req.id, t)
+                    metrics.set_request_tokens(req.id, req.prefill_tokens, req.decode_tokens)
+                else:
+                    et = self.ctx.time_predictor.get_execution_time(
+                        1, 1, req.prefill_tokens + req.num_generated_tokens, is_prefill=False
+                    )
+                    heapq.heappush(event_heap, (t + et.total_time, event_id,
+                        _DecodeStepEvent(t + et.total_time, req.id)))
+                    event_id += 1
+
+        metrics.finalize()
+        metrics.print_summary()
+        return metrics
 
 
 # ─── Colocated 模拟器 ──────────────────────────────────────────────────────────

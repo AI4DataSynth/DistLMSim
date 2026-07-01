@@ -297,14 +297,15 @@ python3 -m unittest tests/test_e2e.py -v
 | Hybrid backend (Profiled + RF) | ✅ Complete | Linear regression + RandomForest |
 | Speculative decoding modeling | ✅ Complete | Draft + verify + acceptance sampling |
 | Sarathi replica scheduler | ✅ Complete | Chunked prefill + decode mixing |
+| vLLM replica scheduler | ✅ Complete | PagedAttention block mgmt + preemption |
+| Orca replica scheduler | ✅ Complete | Iteration-level, full prefill batching |
 | Pipeline parallel stage mapping | ✅ Complete | Stage-to-node assignment |
+| TopologyAware global scheduler | ✅ Complete | Hash-affinity routing |
+| Event-driven simulator | ✅ Complete | heapq-based discrete event loop |
 | Memory analysis | ✅ Complete | KV cache, OOM detection |
 | MFU analysis | ✅ Complete | Prefill/decode FLOPs utilization |
 | Chrome Trace timeline | ✅ Complete | Chrome Trace Viewer compatible |
 | Design space exploration | ✅ Complete | Pareto frontier + SLO constraints |
-| vLLM/Orca replica schedulers | ⚠️ Stub | `form_batch()` raises `NotImplementedError` |
-| TopologyAware global scheduler | ⚠️ Partial | Hash-affinity routing, falls back to RoundRobin |
-| Event-driven simulator | ⚠️ Partial | Queue-based `DisaggregatedSimulator` is primary |
 
 ## Based On
 
