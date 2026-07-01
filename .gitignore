@@ -248,3 +248,7 @@ specification.md
 scripts/*.md
 scripts/*.sh
 scripts/*.exp
+
+# Project-local config
+QWEN.md
+test_h1_verification.py
