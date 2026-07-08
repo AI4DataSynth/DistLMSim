@@ -452,3 +452,233 @@ def _apply_overlap(compute_ms: float, comm_ms: float, ctx: SimContext) -> float:
     pair = proc.make_compute_comm_pair(compute_ms, comm_ms)
     pair = proc.apply_ratio_slowdown(pair)
     return max(pair.adjusted_a_ms, pair.adjusted_b_ms)
+
+
+# ─── 统一 Speculative Decoding Engine ────────────────────────────────────────
+
+
+from dataclasses import dataclass
+from distlmsim.execution.draft_model import DraftModelPredictor, load_sps_curve
+from distlmsim.scheduling.prefix_scheduler import (
+    HardwareAwarePrefixScheduler,
+    generate_confidence_scores,
+)
+import os
+
+
+@dataclass
+class CycleResult:
+    """一轮 decode cycle 的结果。
+
+    K=0 (标准 decode): accepted_tokens=1, scheduled_length=1
+    K>0 (投机解码): accepted_tokens=采样接受数, scheduled_length=前缀调度长度
+    """
+
+    cycle_time_ms: float = 0.0
+    accepted_tokens: int = 1
+    scheduled_length: int = 1
+    draft_time_ms: float = 0.0
+    verify_time_ms: float = 0.0
+    is_speculative: bool = False
+
+
+class SpeculativeDecodingEngine:
+    """统一的投机解码引擎，覆盖标准 decode 和所有投机解码模式。
+
+    一个 cycle 的完整流程:
+    1. [Draft] DraftModelPredictor.get_draft_time() → draft block
+    2. [Sample] 根据 acceptance_rate 和 position_decay 采样接受数
+    3. [Confidence] 生成 confidence scores (如果启用)
+    4. [Schedule] HardwareAwarePrefixScheduler.schedule() → 裁剪 prefix
+    5. [Verify] target model forward(scheduled_length) → 验证
+
+    K=0 / disabled 时: 退化为标准 decode (1 token/step, 无 draft)
+    """
+
+    def __init__(
+        self,
+        ctx: SimContext,
+        config: DisaggregatedConfig,
+        rng: random.Random,
+    ):
+        self._ctx = ctx
+        self._config = config
+        self._rng = rng
+        self._enabled = config.enable_speculative_decoding
+
+        if self._enabled:
+            self._draft_predictor = DraftModelPredictor(
+                ctx.model_config, ctx.device_config, config
+            )
+            self._block_size = config.block_size
+
+            # 加载 SPS 曲线
+            sps_path = config.sps_profile_path
+            if not sps_path:
+                # 自动查找
+                candidates = [
+                    "data/profiling/system/a800/sps_curve.csv",
+                    os.path.join(os.path.dirname(__file__), "../../data/profiling/system/a800/sps_curve.csv"),
+                ]
+                for c in candidates:
+                    if os.path.exists(c):
+                        sps_path = c
+                        break
+            sps_curve = load_sps_curve(sps_path) if sps_path else {}
+
+            self._prefix_scheduler = HardwareAwarePrefixScheduler(
+                sps_curve=sps_curve,
+                confidence_threshold=config.confidence_threshold,
+            )
+        else:
+            self._draft_predictor = None
+            self._block_size = 0
+            self._prefix_scheduler = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @property
+    def block_size(self) -> int:
+        return self._block_size
+
+    def compute_cycle(
+        self,
+        batch_requests: List[Request],
+        current_time: float,
+        compute_standard_step_fn=None,
+    ) -> CycleResult:
+        """计算一轮 decode cycle。
+
+        Args:
+            batch_requests: 当前 batch 中所有活跃请求
+            current_time: 当前模拟时间 (ms)
+            compute_standard_step_fn: 标准 decode 单步时间计算函数
+                (用于 K=0 退化时调用 main.py 的 _compute_decode_step_time)
+
+        Returns:
+            CycleResult
+        """
+        if not self._enabled:
+            # 标准 decode: 1 token/step
+            if compute_standard_step_fn:
+                step_time = compute_standard_step_fn(batch_requests)
+            else:
+                step_time = self._compute_standard_step_time(batch_requests)
+            return CycleResult(
+                cycle_time_ms=step_time,
+                accepted_tokens=1,
+                scheduled_length=1,
+                draft_time_ms=0.0,
+                verify_time_ms=step_time,
+                is_speculative=False,
+            )
+
+        # 投机解码 cycle
+        return self._compute_speculative_cycle(batch_requests)
+
+    def _compute_standard_step_time(
+        self, batch_requests: List[Request]
+    ) -> float:
+        """标准 decode 单步时间 (fallback)。"""
+        model = self._ctx.model_config
+        batch_size = len(batch_requests)
+        avg_kv = sum(
+            r.prefill_tokens + r.num_generated_tokens for r in batch_requests
+        ) // max(1, batch_size)
+
+        et = self._ctx.time_predictor.get_execution_time(
+            num_tokens=1, batch_size=batch_size,
+            kv_cache_size=avg_kv, is_prefill=False,
+        )
+        per_layer = et.total_time
+        tp = self._ctx.tp_size
+        if tp > 1:
+            data_size = batch_size * model.embedding_dim * 2
+            tp_comm = self._ctx.nvlink_model.get_allreduce_time(tp, data_size) * 2
+        else:
+            tp_comm = 0.0
+        return _apply_overlap(per_layer, tp_comm, self._ctx) * model.num_layers
+
+    def _compute_speculative_cycle(
+        self, batch_requests: List[Request]
+    ) -> CycleResult:
+        """投机解码 cycle: draft → sample → schedule → verify。"""
+        batch_size = len(batch_requests)
+        avg_kv = sum(
+            r.prefill_tokens + r.num_generated_tokens for r in batch_requests
+        ) // max(1, batch_size)
+
+        # 1. Draft phase
+        draft_breakdown = self._draft_predictor.get_draft_time(
+            num_tokens=self._block_size,
+            batch_size=batch_size,
+            kv_cache_size=avg_kv,
+        )
+        draft_time = draft_breakdown.total_time_ms
+
+        # 2. Sample acceptance (position-dependent)
+        alpha = self._config.acceptance_rate
+        accepted = 0
+        for k in range(self._block_size):
+            pos_alpha = alpha * (1.0 - 0.05 * k)
+            if self._rng.random() < pos_alpha:
+                accepted += 1
+            else:
+                break
+
+        # 3. Generate confidence scores (for prefix scheduler)
+        if self._config.enable_confidence_scheduling:
+            conf_scores_per_req = []
+            for _ in batch_requests:
+                conf_scores_per_req.append(
+                    generate_confidence_scores(self._block_size, alpha)
+                )
+            scheduled_lengths = self._prefix_scheduler.schedule(
+                batch_requests, conf_scores_per_req, self._block_size
+            )
+            # 取平均 scheduled length (简化: 同一 batch 使用相同长度)
+            scheduled_length = max(1, sum(scheduled_lengths) // batch_size)
+        else:
+            scheduled_length = self._block_size
+
+        # Cap accepted by scheduled length
+        effective_accepted = min(accepted, scheduled_length)
+
+        # 4. Bonus token (标准投机解码保证: 验证后额外接受 1 个 target-generated token)
+        if self._config.bonus_token:
+            effective_accepted = min(effective_accepted + 1, scheduled_length + 1)
+
+        effective_accepted = max(1, effective_accepted)
+
+        # 5. Verify phase: target model forward with scheduled_length tokens
+        num_verify_tokens = scheduled_length * batch_size
+        model = self._ctx.model_config
+        et = self._ctx.time_predictor.get_execution_time(
+            num_tokens=num_verify_tokens, batch_size=batch_size,
+            kv_cache_size=avg_kv, is_prefill=True,
+        )
+        verify_per_layer = et.total_time
+        tp = self._ctx.tp_size
+        if tp > 1:
+            data_size = num_verify_tokens * model.embedding_dim * 2
+            tp_comm = self._ctx.nvlink_model.get_allreduce_time(tp, data_size) * 2
+        else:
+            tp_comm = 0.0
+        verify_time = _apply_overlap(verify_per_layer, tp_comm, self._ctx) * model.num_layers
+
+        # DFlash: draft-verify pipelining
+        if self._config.speculative_mode == "dflash":
+            cycle_time = draft_time + verify_time * 0.7
+        else:
+            cycle_time = draft_time + verify_time
+
+        return CycleResult(
+            cycle_time_ms=cycle_time,
+            accepted_tokens=effective_accepted,
+            scheduled_length=scheduled_length,
+            draft_time_ms=draft_time,
+            verify_time_ms=verify_time,
+            is_speculative=True,
+        )

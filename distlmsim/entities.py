@@ -18,6 +18,7 @@ class RequestStatus(Enum):
     WAITING = "waiting"
     PREFILLING = "prefilling"
     DECODING = "decoding"
+    DRAFTING = "drafting"           # 投机解码: Draft 阶段
     KV_CACHE_TRANSFERRING = "kv_cache_transferring"  # 存算分离：KV Cache 传输中
     COMPLETED = "completed"
     PREEMPTED = "preempted"
@@ -118,6 +119,10 @@ class Request:
     # 分配信息
     replica_id: Optional[int] = None
     num_generated_tokens: int = 0
+    # 投机解码 cycle 追踪
+    draft_tokens_generated: int = 0              # 当前轮 draft 的 token 数
+    accepted_tokens_last_cycle: int = 0           # 上一轮接受的 token 数
+    confidence_scores: Optional[List[float]] = None  # 每位置置信度 (Prefix Scheduler)
 
     @property
     def is_prefill_complete(self) -> bool:

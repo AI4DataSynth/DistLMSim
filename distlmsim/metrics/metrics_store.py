@@ -30,6 +30,23 @@ class RequestMetrics:
     decode_node_id: int = -1
     prefill_tokens: int = 0
     decode_tokens: int = 0
+    # 投机解码指标
+    draft_times: List[float] = field(default_factory=list)
+    verify_times: List[float] = field(default_factory=list)
+    accepted_per_cycle: List[int] = field(default_factory=list)
+    scheduled_lengths: List[int] = field(default_factory=list)
+
+    @property
+    def avg_draft_time(self) -> float:
+        return np.mean(self.draft_times) if self.draft_times else 0.0
+
+    @property
+    def avg_verify_time(self) -> float:
+        return np.mean(self.verify_times) if self.verify_times else 0.0
+
+    @property
+    def avg_accepted_per_cycle(self) -> float:
+        return np.mean(self.accepted_per_cycle) if self.accepted_per_cycle else 0.0
 
     @property
     def ttft(self) -> float:
@@ -118,6 +135,25 @@ class MetricsStore:
         if request_id in self._request_metrics:
             self._request_metrics[request_id].decode_end_time = time
 
+    # ─── 投机解码指标 ──────────────────────────────────────────────────
+
+    def record_spec_cycle(
+        self,
+        request_id: int,
+        draft_time_ms: float,
+        verify_time_ms: float,
+        accepted_tokens: int,
+        scheduled_length: int = 0,
+    ) -> None:
+        """记录一轮投机解码 cycle 的指标。"""
+        if request_id in self._request_metrics:
+            m = self._request_metrics[request_id]
+            m.draft_times.append(draft_time_ms)
+            m.verify_times.append(verify_time_ms)
+            m.accepted_per_cycle.append(accepted_tokens)
+            if scheduled_length > 0:
+                m.scheduled_lengths.append(scheduled_length)
+
     def set_request_tokens(self, request_id: int, prefill_tokens: int, decode_tokens: int) -> None:
         if request_id in self._request_metrics:
             m = self._request_metrics[request_id]
@@ -197,6 +233,22 @@ class MetricsStore:
             if total_prefill_tokens > 0:
                 prefill_throughput = total_prefill_tokens / effective_time_s
                 print(f"    Prefill tokens/s: {prefill_throughput:.1f}")
+
+        # 投机解码统计
+        all_draft = [t for m in completed for t in m.draft_times]
+        all_verify = [t for m in completed for t in m.verify_times]
+        all_accepted = [a for m in completed for a in m.accepted_per_cycle]
+        if all_accepted:
+            avg_acc = np.mean(all_accepted)
+            avg_draft = np.mean(all_draft) if all_draft else 0
+            avg_verify = np.mean(all_verify) if all_verify else 0
+            print(f"\n  --- 投机解码统计 ---")
+            print(f"    平均每轮接受 tokens: {avg_acc:.1f}")
+            print(f"    平均 draft 时间: {avg_draft:.3f} ms")
+            print(f"    平均 verify 时间: {avg_verify:.3f} ms")
+            if avg_verify > 0:
+                speedup = avg_acc * avg_verify / (avg_draft + avg_verify)
+                print(f"    有效加速比: {speedup:.2f}x")
 
         print(f"\n  --- 节点负载 ---")
         print(f"    Prefill 节点: {dict(self._prefill_node_counts)}")

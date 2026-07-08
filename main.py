@@ -363,6 +363,15 @@ class DisaggregatedSimulator:
             )
         return self._spec_decoder
 
+    def _get_spec_engine(self) -> "SpeculativeDecodingEngine":
+        """懒初始化统一的 SpeculativeDecodingEngine。"""
+        if not hasattr(self, '_spec_engine') or self._spec_engine is None:
+            from distlmsim.execution.speculative_decoder import SpeculativeDecodingEngine
+            self._spec_engine = SpeculativeDecodingEngine(
+                self.ctx, self.config.disaggregated, self._rng
+            )
+        return self._spec_engine
+
     def _compute_dynamic_batch_sizes(self) -> tuple:
         """基于 GPU 显存容量动态计算 prefill 和 decode 的最大 batch size。
 
@@ -730,76 +739,35 @@ class DisaggregatedSimulator:
             batch_ready = max(kv_ready_time[r.id] for r in decode_batch)
             current_time = max(decode_free_time, batch_ready)
 
-            # ─── Speculative Decoding 分支 ───────────────────────────────
-            spec_cfg = self.config.disaggregated
-            use_spec = spec_cfg.enable_speculative_decoding
-            K = spec_cfg.speculation_length if use_spec else 1
-            alpha = spec_cfg.acceptance_rate if use_spec else 1.0
+            # ─── 统一 Decode 循环 (draft-schedule-verify / 标准 decode) ──
+            spec_engine = self._get_spec_engine()
 
-            max_decode_len = max(r.decode_tokens for r in decode_batch)
-            if use_spec:
-                # Speculative decoding: draft→verify 循环 (委托给 SpeculativeDecoder)
-                spec_decoder = self._get_spec_decoder()
-                while True:
-                    active = [r for r in decode_batch if r.num_generated_tokens < r.decode_tokens]
-                    if not active:
-                        break
+            while True:
+                active = [r for r in decode_batch if r.num_generated_tokens < r.decode_tokens]
+                if not active:
+                    break
 
-                    min_remaining = min(r.decode_tokens - r.num_generated_tokens for r in active)
-                    effective_K = min(K, min_remaining)
+                for req in active:
+                    if req.decode_start_time is None:
+                        req.decode_start_time = current_time
+                        ms.record_decode_start(req.id, current_time, self.ctx.decode_node_id)
 
-                    if effective_K <= 0:
-                        break
+                # 统一 cycle: K=0 退化为标准 decode (1 token/step)
+                result = spec_engine.compute_cycle(
+                    active, current_time,
+                    compute_standard_step_fn=self._compute_decode_step_time,
+                )
+                step_end = current_time + result.cycle_time_ms
 
-                    for req in active:
-                        if req.decode_start_time is None:
-                            req.decode_start_time = current_time
-                            ms.record_decode_start(req.id, current_time, self.ctx.decode_node_id)
+                for req in active:
+                    req.num_generated_tokens += result.accepted_tokens
+                    req.accepted_tokens_last_cycle = result.accepted_tokens
+                    if req.num_generated_tokens >= req.decode_tokens:
+                        req.decode_end_time = step_end
+                        req.status = RequestStatus.COMPLETED
+                        ms.record_decode_end(req.id, step_end)
 
-                    # Draft 阶段: K 步 decode
-                    draft_time = 0.0
-                    for _k in range(effective_K):
-                        draft_time += spec_decoder.compute_draft_step_time(active)
-
-                    # Verify 阶段: 1 次 forward pass
-                    verify_time = spec_decoder.compute_verify_time(active, effective_K)
-
-                    # 采样接受 token 数
-                    accepted = spec_decoder.sample_acceptance(effective_K, alpha)
-                    total_accepted = min(accepted + 1, effective_K)
-
-                    round_time = draft_time + verify_time
-                    step_end = current_time + round_time
-
-                    for req in active:
-                        req.num_generated_tokens += total_accepted
-                        if req.num_generated_tokens >= req.decode_tokens:
-                            req.decode_end_time = step_end
-                            req.status = RequestStatus.COMPLETED
-                            ms.record_decode_end(req.id, step_end)
-
-                    current_time = step_end
-            else:
-                # 标准 decode: 每步 1 token
-                for step in range(max_decode_len):
-                    active = [r for r in decode_batch if r.num_generated_tokens < r.decode_tokens]
-                    if not active:
-                        break
-
-                    step_time = self._compute_decode_step_time(active)
-                    step_end = current_time + step_time
-
-                    for req in active:
-                        req.num_generated_tokens += 1
-                        if req.decode_start_time is None:
-                            req.decode_start_time = current_time
-                            ms.record_decode_start(req.id, current_time, self.ctx.decode_node_id)
-                        if req.num_generated_tokens >= req.decode_tokens:
-                            req.decode_end_time = step_end
-                            req.status = RequestStatus.COMPLETED
-                            ms.record_decode_end(req.id, step_end)
-
-                    current_time = step_end
+                current_time = step_end
 
             decode_free_time = current_time
 

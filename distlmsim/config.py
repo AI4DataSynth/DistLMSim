@@ -169,6 +169,10 @@ class DisaggregatedConfig:
     num_target_layer_ids: int = 5       # DSpark: 从目标模型抽取的中间层数
     confidence_threshold: float = 0.0   # DSpark: 置信度早停阈值 (0=不启用)
     enable_confidence_scheduling: bool = False  # DSpark: 负载感知置信度调度
+    # Draft model & SPS profiling
+    draft_model_name: str = "dspark_5l_512d"  # Draft model 标识 (用于查找 profiling)
+    sps_profile_path: str = ""            # SPS 曲线文件路径 (空=自动查找)
+    bonus_token: bool = True              # 是否添加 bonus token (标准投机解码保证)
     # MoE Expert Load Imbalance
     moe_expert_load_zipf_alpha: float = 1.0  # Zipf α 控制 token→expert 分布偏斜度
                                               # 1.0 = 均匀, >1.0 = 偏斜
