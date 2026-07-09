@@ -242,6 +242,7 @@ tests/
 # Non-simulator artifacts (documentation, TODOs, profiling reports)
 specification.md
 *TODO*.md
+*PLAN*.md
 *REPORT*.md
 *SUMMARY*.md
 *STATUS*.md
