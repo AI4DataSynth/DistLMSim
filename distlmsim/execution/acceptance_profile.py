@@ -48,21 +48,22 @@ _BUILTIN_DFLASH: Dict[str, PositionAcceptance] = {
 }
 
 # DSpark: 半自回归, suffix decay 被 Markov head 缓解
+# 数据校准: 论文 Figure 2 显示 DSpark Math pos1=0.93, 所有 domain 的 pos1 调高 ~0.05
 _BUILTIN_DSPARK: Dict[str, PositionAcceptance] = {
     "math": PositionAcceptance(
-        conditional_rates=[0.88, 0.88, 0.87, 0.87, 0.86, 0.86, 0.85],
+        conditional_rates=[0.93, 0.91, 0.90, 0.89, 0.88, 0.88, 0.87],
         block_size=7,
     ),
     "code": PositionAcceptance(
-        conditional_rates=[0.82, 0.82, 0.81, 0.81, 0.80, 0.80, 0.79],
+        conditional_rates=[0.87, 0.85, 0.84, 0.83, 0.83, 0.82, 0.82],
         block_size=7,
     ),
     "chat": PositionAcceptance(
-        conditional_rates=[0.72, 0.72, 0.71, 0.70, 0.70, 0.69, 0.69],
+        conditional_rates=[0.76, 0.74, 0.73, 0.72, 0.71, 0.71, 0.70],
         block_size=7,
     ),
     "mixed": PositionAcceptance(
-        conditional_rates=[0.80, 0.80, 0.79, 0.79, 0.78, 0.78, 0.77],
+        conditional_rates=[0.85, 0.83, 0.82, 0.81, 0.81, 0.80, 0.80],
         block_size=7,
     ),
 }

@@ -471,10 +471,12 @@ class CycleResult:
 
     K=0 (标准 decode): accepted_tokens=1, scheduled_length=1
     K>0 (投机解码): accepted_tokens=采样接受数, scheduled_length=前缀调度长度
+    per_request_accepted: 每个 request 独立的 accepted tokens (取决于各自的 scheduled_length)
     """
 
     cycle_time_ms: float = 0.0
     accepted_tokens: int = 1
+    per_request_accepted: list = None
     scheduled_length: int = 1
     draft_time_ms: float = 0.0
     verify_time_ms: float = 0.0
@@ -617,13 +619,18 @@ class SpeculativeDecodingEngine:
             return CycleResult(
                 cycle_time_ms=step_time,
                 accepted_tokens=1,
+                per_request_accepted=[1] * len(batch_requests),
                 scheduled_length=1,
                 draft_time_ms=0.0,
                 verify_time_ms=step_time,
                 is_speculative=False,
             )
 
-        # 投机解码 cycle
+        # MTP-1: 无 draft model 的轻量投机解码
+        if self._config.speculative_mode == "mtp1":
+            return self._compute_mtp1_cycle(batch_requests)
+
+        # 投机解码 cycle (DFlash / DSpark)
         return self._compute_speculative_cycle(batch_requests)
 
     def _compute_standard_step_time(
@@ -648,6 +655,60 @@ class SpeculativeDecodingEngine:
         else:
             tp_comm = 0.0
         return _apply_overlap(per_layer, tp_comm, self._ctx) * model.num_layers
+
+    def _compute_mtp1_cycle(
+        self, batch_requests: List[Request]
+    ) -> CycleResult:
+        """MTP-1 cycle: 无 draft model, target model 生成 1 token + 验证 1 MTP token。
+
+        MTP-1 是 DeepSeek 生产环境的 baseline:
+        - Target model 在生成当前 token 时，同时预测下一个 token (MTP head)
+        - 无独立 draft model → draft_time = 0
+        - block_size 有效值 = 1
+        - 接受率由 config.acceptance_rate 控制 (默认 ~0.8)
+        """
+        batch_size = len(batch_requests)
+        avg_kv = sum(
+            r.prefill_tokens + r.num_generated_tokens for r in batch_requests
+        ) // max(1, batch_size)
+
+        # MTP-1: 无 draft model
+        draft_time = 0.0
+
+        # 单 token acceptance (MTP head 预测的下一个 token)
+        accept_rate = self._config.acceptance_rate
+        accepted = 1 if self._rng.random() < accept_rate else 0
+        # bonus token: 至少 1
+        effective_accepted = max(1, accepted + 1) if self._config.bonus_token else max(1, accepted)
+
+        # Verify: target model forward with batch_size × (1 + 1) tokens
+        total_verify_tokens = batch_size * 2
+        model = self._ctx.model_config
+        et = self._ctx.time_predictor.get_execution_time(
+            num_tokens=total_verify_tokens, batch_size=batch_size,
+            kv_cache_size=avg_kv, is_prefill=True,
+        )
+        verify_per_layer = et.total_time
+        tp = self._ctx.tp_size
+        if tp > 1:
+            data_size = total_verify_tokens * model.embedding_dim * 2
+            tp_comm = self._ctx.nvlink_model.get_allreduce_time(tp, data_size) * 2
+        else:
+            tp_comm = 0.0
+        verify_time = _apply_overlap(verify_per_layer, tp_comm, self._ctx) * model.num_layers
+
+        cycle_time = draft_time + verify_time
+        per_request_accepted = [effective_accepted] * batch_size
+
+        return CycleResult(
+            cycle_time_ms=cycle_time,
+            accepted_tokens=effective_accepted,
+            per_request_accepted=per_request_accepted,
+            scheduled_length=1,
+            draft_time_ms=0.0,
+            verify_time_ms=verify_time,
+            is_speculative=True,
+        )
 
     def _compute_speculative_cycle(
         self, batch_requests: List[Request]
@@ -706,6 +767,14 @@ class SpeculativeDecodingEngine:
             effective_accepted = min(effective_accepted + 1, min_scheduled + 1)
         effective_accepted = max(1, effective_accepted)
 
+        # 5b. Per-request accepted: 每个 request 根据各自的 scheduled_length 计算
+        per_request_accepted = []
+        for i in range(batch_size):
+            req_acc = min(accepted, scheduled_lengths[i])
+            if self._config.bonus_token:
+                req_acc = min(req_acc + 1, scheduled_lengths[i] + 1)
+            per_request_accepted.append(max(1, req_acc))
+
         # 6. Verify phase: target model forward with actual token count
         model = self._ctx.model_config
         et = self._ctx.time_predictor.get_execution_time(
@@ -728,6 +797,7 @@ class SpeculativeDecodingEngine:
         return CycleResult(
             cycle_time_ms=cycle_time,
             accepted_tokens=effective_accepted,
+            per_request_accepted=per_request_accepted,
             scheduled_length=avg_scheduled,
             draft_time_ms=draft_time,
             verify_time_ms=verify_time,

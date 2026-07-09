@@ -759,12 +759,16 @@ class DisaggregatedSimulator:
                 )
                 step_end = current_time + result.cycle_time_ms
 
-                for req in active:
-                    req.num_generated_tokens += result.accepted_tokens
-                    req.accepted_tokens_last_cycle = result.accepted_tokens
+                for i, req in enumerate(active):
+                    if result.per_request_accepted is not None:
+                        req_accepted = result.per_request_accepted[i]
+                    else:
+                        req_accepted = result.accepted_tokens
+                    req.num_generated_tokens += req_accepted
+                    req.accepted_tokens_last_cycle = req_accepted
                     if result.is_speculative:
                         req.total_spec_cycles += 1
-                        req.total_spec_accepted += result.accepted_tokens
+                        req.total_spec_accepted += req_accepted
                     if req.num_generated_tokens >= req.decode_tokens:
                         req.decode_end_time = step_end
                         req.status = RequestStatus.COMPLETED
