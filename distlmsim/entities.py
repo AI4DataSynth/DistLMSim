@@ -125,6 +125,9 @@ class Request:
     confidence_scores: Optional[List[float]] = None  # 每位置置信度 (Prefix Scheduler)
     # 工作负载域 (影响投机解码接受率 profile)
     domain: str = "mixed"                        # math/code/chat/mixed
+    # Speculative decoding cycle 累计统计
+    total_spec_cycles: int = 0
+    total_spec_accepted: int = 0
 
     @property
     def is_prefill_complete(self) -> bool:

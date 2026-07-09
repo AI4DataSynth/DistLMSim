@@ -762,6 +762,9 @@ class DisaggregatedSimulator:
                 for req in active:
                     req.num_generated_tokens += result.accepted_tokens
                     req.accepted_tokens_last_cycle = result.accepted_tokens
+                    if result.is_speculative:
+                        req.total_spec_cycles += 1
+                        req.total_spec_accepted += result.accepted_tokens
                     if req.num_generated_tokens >= req.decode_tokens:
                         req.decode_end_time = step_end
                         req.status = RequestStatus.COMPLETED

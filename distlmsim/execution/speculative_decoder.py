@@ -411,13 +411,11 @@ class DSparkSpeculativeDecoder:
         # Verify: target model forward (block_size tokens)
         verify_time = self.compute_verify_time(batch_requests)
 
-        # DFlash 并行起草: 如果有多个 block 并行，verify 可以流水线化
-        if self._cfg.speculative_mode == "dflash":
-            # DFlash 使用并行 block 起草，draft 和 verify 可部分重叠
-            overlap_factor = 0.7  # DFlash 的并行加速比
-            cycle_time = draft_time + verify_time * overlap_factor
-        else:
-            cycle_time = draft_time + verify_time
+        # DFlash 和 DSpark 的 cycle time 计算相同:
+        # T_cycle = T_draft + T_verify
+        # DFlash 优势在 draft 更快 (无 sequential head)
+        # DSpark 优势在 accepted 更多 (Markov head 缓解 suffix decay)
+        cycle_time = draft_time + verify_time
 
         return cycle_time, accepted
 
@@ -514,10 +512,9 @@ class SpeculativeDecodingEngine:
             self._block_size = config.block_size
             self._acceptance_profile = AcceptanceProfile(config)
 
-            # 加载 SPS 曲线
+            # 加载 SPS 曲线 (profiled or synthetic)
             sps_path = config.sps_profile_path
             if not sps_path:
-                # 自动查找
                 candidates = [
                     "data/profiling/system/a800/sps_curve.csv",
                     os.path.join(os.path.dirname(__file__), "../../data/profiling/system/a800/sps_curve.csv"),
@@ -526,7 +523,10 @@ class SpeculativeDecodingEngine:
                     if os.path.exists(c):
                         sps_path = c
                         break
-            sps_curve = load_sps_curve(sps_path) if sps_path else {}
+            if sps_path:
+                sps_curve = load_sps_curve(sps_path)
+            else:
+                sps_curve = self._generate_synthetic_sps(ctx)
 
             self._prefix_scheduler = HardwareAwarePrefixScheduler(
                 sps_curve=sps_curve,
@@ -536,6 +536,52 @@ class SpeculativeDecodingEngine:
             self._draft_predictor = None
             self._block_size = 0
             self._prefix_scheduler = None
+
+    @staticmethod
+    def _generate_synthetic_sps(ctx) -> dict:
+        """使用 Roofline 模型合成 SPS(B) 曲线。
+
+        对 target model decode 阶段建模:
+        - 小 batch: compute-bound, SPS 高且平坦
+        - 大 batch: memory-bound, SPS 随 B 线性下降
+        """
+        model = ctx.model_config
+        device = ctx.device_config
+        tp = ctx.tp_size
+
+        # 每 GPU 的 active params (bytes, fp16)
+        # MoE: active_params ≈ num_layers × (attn + active_experts × mlp)
+        # 简化: total_params ≈ 2 × layers × dim × (4*dim + vocab/tp)
+        params_per_gpu = 2 * model.num_layers * model.embedding_dim * (
+            4 * model.embedding_dim + model.vocab_size // max(1, tp)
+        )
+        # MoE: 只有 top_k / num_experts 的 params 是 active
+        if model.num_experts > 0 and model.top_k_experts > 0:
+            moe_ratio = model.top_k_experts / model.num_experts
+            # attn params + moe active params
+            attn_params = 2 * model.num_layers * model.embedding_dim * 4 * model.embedding_dim
+            moe_params = 2 * model.num_layers * model.embedding_dim * (
+                model.vocab_size // max(1, tp)
+            ) * moe_ratio
+            params_per_gpu = attn_params + moe_params
+
+        mem_bw = device.memory_bandwidth_gbps * 1e9  # B/s
+        peak_flops = device.fp16_tflops * 1e12
+        eta_m = 0.90
+        eta_c = 0.85
+
+        sps = {}
+        for B in range(1, 513):
+            # Decode: memory-bound (每 token 读一遍 active params)
+            mem_time_s = (B * params_per_gpu) / (eta_m * mem_bw * max(1, tp))
+            # Compute: 2 × B × params FLOPs
+            compute_time_s = (2 * B * params_per_gpu) / (eta_c * peak_flops * max(1, tp))
+            # Roofline: max(compute, memory) × num_layers
+            step_time_s = max(compute_time_s, mem_time_s) * model.num_layers
+            # 加一个固定 overhead (kernel launch, etc.)
+            step_time_s += 0.0005
+            sps[B] = 1.0 / step_time_s if step_time_s > 0 else 1.0
+        return sps
 
     @property
     def enabled(self) -> bool:
@@ -675,11 +721,8 @@ class SpeculativeDecodingEngine:
             tp_comm = 0.0
         verify_time = _apply_overlap(verify_per_layer, tp_comm, self._ctx) * model.num_layers
 
-        # DFlash: draft-verify pipelining
-        if self._config.speculative_mode == "dflash":
-            cycle_time = draft_time + verify_time * 0.7
-        else:
-            cycle_time = draft_time + verify_time
+        # cycle_time = draft_time + verify_time (DFlash 和 DSpark 共用)
+        cycle_time = draft_time + verify_time
 
         avg_scheduled = sum(scheduled_lengths) // batch_size
         return CycleResult(
