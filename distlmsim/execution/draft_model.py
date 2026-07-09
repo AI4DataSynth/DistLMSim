@@ -111,7 +111,11 @@ class DraftModelPredictor:
         parallel_time = et.total_time * self._draft_model.num_layers
 
         # 2. Sequential head: Markov/RNN, block_size steps
-        sequential_time = self._compute_sequential_head_time(num_tokens, batch_size)
+        # DFlash 是纯并行 drafter，无 sequential head
+        if self._spec.speculative_mode == "dflash":
+            sequential_time = 0.0
+        else:
+            sequential_time = self._compute_sequential_head_time(num_tokens, batch_size)
 
         # 3. Confidence head: negligible
         confidence_time = self._compute_confidence_head_time(num_tokens, batch_size)

@@ -173,6 +173,13 @@ class DisaggregatedConfig:
     draft_model_name: str = "dspark_5l_512d"  # Draft model 标识 (用于查找 profiling)
     sps_profile_path: str = ""            # SPS 曲线文件路径 (空=自动查找)
     bonus_token: bool = True              # 是否添加 bonus token (标准投机解码保证)
+    # Acceptance Profile (DFlash/DSpark 位置级接受率)
+    acceptance_profile_path: str = ""     # 外部 profile JSON 路径 (空=使用内置)
+    default_domain: str = "mixed"         # 默认 workload domain (math/code/chat/mixed)
+    dflash_pos1_alpha: float = 0.88       # DFlash 位置 1 基础接受率
+    dflash_decay_rate: float = 0.03       # DFlash 位置衰减率 (快速, suffix decay)
+    dspark_pos1_alpha: float = 0.88       # DSpark 位置 1 基础接受率 (继承 DFlash)
+    dspark_decay_rate: float = 0.008      # DSpark 位置衰减率 (平稳, Markov head 缓解)
     # MoE Expert Load Imbalance
     moe_expert_load_zipf_alpha: float = 1.0  # Zipf α 控制 token→expert 分布偏斜度
                                               # 1.0 = 均匀, >1.0 = 偏斜

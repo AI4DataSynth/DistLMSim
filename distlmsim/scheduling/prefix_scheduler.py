@@ -73,6 +73,7 @@ class HardwareAwarePrefixScheduler:
         requests: List[Request],
         confidence_scores: List[List[float]],
         block_size: int,
+        current_batch_size: int = 0,
     ) -> List[int]:
         """计算每个 request 的 scheduled prefix length。
 
@@ -81,6 +82,7 @@ class HardwareAwarePrefixScheduler:
             confidence_scores: 每个 request 的 confidence scores
                 confidence_scores[r] = [c_{r,1}, ..., c_{r,γ}]
             block_size: draft block 大小 (γ)
+            current_batch_size: 当前 decode batch 请求数 (用于 SPS 查询)
 
         Returns:
             List[int]: 每个 request 的 scheduled prefix length
@@ -88,6 +90,8 @@ class HardwareAwarePrefixScheduler:
         R = len(requests)
         if R == 0:
             return []
+
+        base_bs = current_batch_size if current_batch_size > 0 else R
 
         # 退化: 无 confidence scores → 返回 full block
         if not confidence_scores or all(not cs for cs in confidence_scores):
@@ -98,7 +102,7 @@ class HardwareAwarePrefixScheduler:
             return self._static_threshold_schedule(confidence_scores, block_size)
 
         # Algorithm 1: Hardware-Aware Prefix Scheduler
-        return self._greedy_schedule(confidence_scores, block_size)
+        return self._greedy_schedule(confidence_scores, block_size, base_bs)
 
     def _static_threshold_schedule(
         self,
@@ -123,12 +127,14 @@ class HardwareAwarePrefixScheduler:
         self,
         confidence_scores: List[List[float]],
         block_size: int,
+        base_batch_size: int = 0,
     ) -> List[int]:
         """贪心调度 (DSpark Algorithm 1)。"""
         R = len(confidence_scores)
+        if base_batch_size <= 0:
+            base_batch_size = R
 
         # Step 1: 计算 prefix survival probabilities
-        # a[r][j] = Π_{i=0}^{j} c_{r,i}
         survival: List[List[float]] = []
         for r in range(R):
             cs = confidence_scores[r]
@@ -140,7 +146,7 @@ class HardwareAwarePrefixScheduler:
             survival.append(a)
 
         # Step 2: 收集所有 valid (r, j) pairs
-        candidates: List[Tuple[float, int, int]] = []  # (survival_prob, r, j)
+        candidates: List[Tuple[float, int, int]] = []
         for r in range(R):
             for j in range(len(survival[r])):
                 if survival[r][j] > 0:
@@ -149,34 +155,27 @@ class HardwareAwarePrefixScheduler:
         # Step 3: 按 survival probability 降序排序
         candidates.sort(key=lambda x: -x[0])
 
-        # Step 4: 贪心 admit tokens
-        admitted: List[int] = [0] * R  # admitted prefix length per request
-        # admitted 需要是前缀连续的: 如果 admit (r, j), 必须已 admit (r, 0..j-1)
-        # 所以我们用一个 set 跟踪每个 r 已 admit 的最大连续 prefix
-        admitted_set: List[int] = [0] * R  # 已 admit 的最大连续位置+1
+        # Step 4: 贪心 admit tokens (修正: B = Σ(1 + l_r))
+        admitted: List[int] = [0] * R
+        B = base_batch_size  # 初始: 每请求至少 1 个 anchor token
+        tau_star = float(base_batch_size)
 
-        best_throughput = 0.0
+        best_throughput = tau_star * self._lookup_sps(B)
         best_admitted = [0] * R
 
         for prob, r, j in candidates:
-            # 只有当 j 是当前 r 的下一个连续位置时才 admit
-            if j != admitted_set[r]:
+            if j != admitted[r]:
                 continue
 
-            # Tentatively admit this token
-            admitted_set[r] = j + 1
+            admitted[r] = j + 1
+            B += 1  # 每个 admit 的 token 增加 verify batch size
+            tau_star += prob
 
-            # 计算当前总 accept 和 throughput
-            total_accepted = sum(admitted_set)
-            batch_size = R
-            sps = self._lookup_sps(batch_size)
-            throughput = total_accepted * sps
-
+            throughput = tau_star * self._lookup_sps(B)
             if throughput >= best_throughput:
                 best_throughput = throughput
-                best_admitted = list(admitted_set)
+                best_admitted = list(admitted)
             else:
-                # Throughput 下降 → early stop
                 break
 
         # 确保至少 verify 1 token per request

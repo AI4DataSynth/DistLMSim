@@ -195,14 +195,26 @@ DistLMSim supports DeepSeek's DSpark and DFlash speculative decoding schemes
 | `draft_num_layers` | 5 | Draft model transformer layers |
 | `draft_embedding_dim` | 512 | Draft model hidden dimension |
 | `acceptance_rate` | 0.8 | Average token acceptance rate (0-1) |
+| `acceptance_profile_path` | `""` | External acceptance profile JSON (empty=built-in) |
+| `default_domain` | `"mixed"` | Default workload domain (`math`/`code`/`chat`/`mixed`) |
+| `dflash_pos1_alpha` | 0.88 | DFlash position-1 base acceptance rate |
+| `dflash_decay_rate` | 0.03 | DFlash position decay rate (fast suffix decay) |
+| `dspark_pos1_alpha` | 0.88 | DSpark position-1 base acceptance rate |
+| `dspark_decay_rate` | 0.008 | DSpark position decay rate (stable, Markov head mitigates decay) |
 
 **DSpark** uses semi-autoregressive drafting with Markov heads:
 - Block-based: generates `block_size` tokens per round
 - Markov head models token-to-token dependency via low-rank embedding (vocab→rank→vocab)
 - Taps into target model's intermediate layers for feature extraction
 - Confidence scheduling enables early stopping for low-confidence blocks
+- **Domain-aware acceptance profiles**: position-level acceptance rates differ by
+  workload domain (math/code/chat), reflecting varying predictability
 
-**DFlash** extends DSpark with parallel block drafting and draft-verify pipelining.
+**DFlash** is a pure parallel drafter (no sequential head):
+- All draft tokens generated in a single forward pass (O(1) w.r.t. block size)
+- Suffers from suffix decay due to multi-modal collisions (independent predictions)
+- Draft-verify pipelining (0.7× verify overlap factor)
+- **Domain-aware acceptance profiles**: faster position decay than DSpark
 
 Run speculative decoding experiment:
 
@@ -255,6 +267,7 @@ DistLMSim/
 │   │   ├── replica_scheduler.py     #   Replica-level scheduling (Sarathi/vLLM/Orca)
 │   │   ├── advanced_schedulers.py   #   MLFQ/PO/OPT/LightLLM schedulers
 │   │   ├── disaggregated_scheduler.py # Disaggregated prefill/decode scheduling
+│   │   ├── prefix_scheduler.py      #   DSpark Hardware-Aware Prefix Scheduler (Algorithm 1)
 │   │   └── migration.py             #   Request migration
 │   ├── parallelism/                 # Parallelism strategies
 │   │   ├── tensor_parallel.py       #   TP (intra-node NVLink)
@@ -264,6 +277,8 @@ DistLMSim/
 │   ├── execution/                   # Execution time prediction
 │   │   ├── execution_time_predictor.py # Analytical (Roofline) / Profiling / RandomForest
 │   │   ├── network_time_predictor.py   # Network time prediction
+│   │   ├── acceptance_profile.py    #   Position-level acceptance profiles (DFlash/DSpark × domain)
+│   │   ├── draft_model.py           #   Draft model time prediction (parallel + sequential head)
 │   │   └── speculative_decoder.py   #   Speculative decoding modeling
 │   ├── request/                     # Request generation
 │   │   └── request_generator.py     #   Synthetic + Trace replay + MoE distributions
@@ -275,7 +290,7 @@ DistLMSim/
 │   │   └── timeline_analysis.py     #   Chrome Trace JSON timeline
 │   └── design/                      # Design space exploration
 │       └── design_space_explorer.py #   TP/EP/scheduler enumeration + Pareto
-├── tests/                           # Unit tests (313 tests)
+├── tests/                           # Unit tests (338 tests)
 │   ├── run_tests.py                 #   Test runner
 │   ├── test_e2e.py                  #   End-to-end integration tests
 │   └── test_*.py                    #   Per-module unit tests
@@ -307,7 +322,7 @@ pip install -r requirements.txt
 ## Running Tests
 
 ```bash
-# Run all 313 unit tests
+# Run all 338 unit tests
 python3 tests/run_tests.py
 
 # Run specific test file
@@ -327,7 +342,7 @@ python3 -m unittest tests/test_e2e.py -v
 | Communication-computation overlap | ✅ Complete | Ratio-based + bandwidth-aware |
 | Roofline execution time predictor | ✅ Complete | Compute/memory-bound modeling |
 | Hybrid backend (Profiled + RF) | ✅ Complete | Linear regression + RandomForest |
-| Speculative decoding modeling | ✅ Complete | Standard + DSpark/DFlash (DeepSeek) |
+| Speculative decoding modeling | ✅ Complete | Standard + DSpark/DFlash with domain-aware acceptance profiles |
 | Sarathi replica scheduler | ✅ Complete | Chunked prefill + decode mixing |
 | vLLM replica scheduler | ✅ Complete | PagedAttention block mgmt + preemption |
 | Orca replica scheduler | ✅ Complete | Iteration-level, full prefill batching |

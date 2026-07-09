@@ -81,6 +81,14 @@ class KVCacheTransferStrategy(Enum):
     STORE_FORWARD = auto()  # 先存到共享存储再取
 
 
+class WorkloadDomain(Enum):
+    """请求的工作负载域，影响投机解码的接受率 profile"""
+    MATH = "math"
+    CODE = "code"
+    CHAT = "chat"
+    MIXED = "mixed"
+
+
 class EventType(Enum):
     """事件类型"""
     REQUEST_ARRIVAL = auto()

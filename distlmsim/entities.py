@@ -123,6 +123,8 @@ class Request:
     draft_tokens_generated: int = 0              # 当前轮 draft 的 token 数
     accepted_tokens_last_cycle: int = 0           # 上一轮接受的 token 数
     confidence_scores: Optional[List[float]] = None  # 每位置置信度 (Prefix Scheduler)
+    # 工作负载域 (影响投机解码接受率 profile)
+    domain: str = "mixed"                        # math/code/chat/mixed
 
     @property
     def is_prefill_complete(self) -> bool:

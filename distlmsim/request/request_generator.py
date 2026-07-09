@@ -222,7 +222,25 @@ class SyntheticRequestGenerator(BaseRequestGenerator):
             arrival_time=arrival_time,
             prefill_tokens=prefill_tokens,
             decode_tokens=decode_tokens,
+            domain=self._sample_domain(),
         )
+
+    def _sample_domain(self) -> str:
+        """按论文训练数据比例采样 workload domain。
+
+        比例来源: Open-PerfectBlend (DSpark 论文 Section 4.1)
+        - math: 39.4%
+        - code: 38.9%
+        - chat: 17.6%
+        - instruction: 4.1% (归入 chat)
+        """
+        r = self._rng.random()
+        if r < 0.394:
+            return "math"
+        elif r < 0.783:
+            return "code"
+        else:
+            return "chat"
 
     def _sample_length(self, mean: int) -> int:
         """采样请求长度。委托给长度生成器。"""

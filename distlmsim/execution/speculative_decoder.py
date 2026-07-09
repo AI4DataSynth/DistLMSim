@@ -459,6 +459,7 @@ def _apply_overlap(compute_ms: float, comm_ms: float, ctx: SimContext) -> float:
 
 from dataclasses import dataclass
 from distlmsim.execution.draft_model import DraftModelPredictor, load_sps_curve
+from distlmsim.execution.acceptance_profile import AcceptanceProfile
 from distlmsim.scheduling.prefix_scheduler import (
     HardwareAwarePrefixScheduler,
     generate_confidence_scores,
@@ -511,6 +512,7 @@ class SpeculativeDecodingEngine:
                 ctx.model_config, ctx.device_config, config
             )
             self._block_size = config.block_size
+            self._acceptance_profile = AcceptanceProfile(config)
 
             # 加载 SPS 曲线
             sps_path = config.sps_profile_path
@@ -618,51 +620,56 @@ class SpeculativeDecodingEngine:
         )
         draft_time = draft_breakdown.total_time_ms
 
-        # 2. Sample acceptance (position-dependent)
-        alpha = self._config.acceptance_rate
+        # 2. Domain-aware acceptance sampling
+        # 推断 batch 的主要 domain (多数投票)
+        domains = [getattr(r, 'domain', 'mixed') for r in batch_requests]
+        primary_domain = max(set(domains), key=domains.count)
+        cond_rates = self._acceptance_profile.get_conditional_rates(primary_domain)
+
         accepted = 0
         for k in range(self._block_size):
-            pos_alpha = alpha * (1.0 - 0.05 * k)
-            if self._rng.random() < pos_alpha:
+            if self._rng.random() < cond_rates[k]:
                 accepted += 1
             else:
                 break
 
-        # 3. Generate confidence scores (for prefix scheduler)
+        # 3. Confidence scores + prefix scheduler (domain-aware)
         if self._config.enable_confidence_scheduling:
             conf_scores_per_req = []
-            for _ in batch_requests:
+            for req in batch_requests:
+                req_domain = getattr(req, 'domain', 'mixed')
                 conf_scores_per_req.append(
-                    generate_confidence_scores(self._block_size, alpha)
+                    self._acceptance_profile.get_conditional_rates(req_domain)
                 )
             scheduled_lengths = self._prefix_scheduler.schedule(
-                batch_requests, conf_scores_per_req, self._block_size
+                batch_requests, conf_scores_per_req, self._block_size,
+                current_batch_size=batch_size,
             )
-            # 取平均 scheduled length (简化: 同一 batch 使用相同长度)
-            scheduled_length = max(1, sum(scheduled_lengths) // batch_size)
         else:
-            scheduled_length = self._block_size
+            scheduled_lengths = [self._block_size] * batch_size
 
-        # Cap accepted by scheduled length
-        effective_accepted = min(accepted, scheduled_length)
+        # 4. 计算实际验证 batch size: B = Σ(1 + l_r)
+        min_scheduled = min(scheduled_lengths)
+        total_verify_tokens = sum(1 + l for l in scheduled_lengths)
 
-        # 4. Bonus token (标准投机解码保证: 验证后额外接受 1 个 target-generated token)
+        # Cap accepted by per-request minimum scheduled length
+        effective_accepted = min(accepted, min_scheduled)
+
+        # 5. Bonus token
         if self._config.bonus_token:
-            effective_accepted = min(effective_accepted + 1, scheduled_length + 1)
-
+            effective_accepted = min(effective_accepted + 1, min_scheduled + 1)
         effective_accepted = max(1, effective_accepted)
 
-        # 5. Verify phase: target model forward with scheduled_length tokens
-        num_verify_tokens = scheduled_length * batch_size
+        # 6. Verify phase: target model forward with actual token count
         model = self._ctx.model_config
         et = self._ctx.time_predictor.get_execution_time(
-            num_tokens=num_verify_tokens, batch_size=batch_size,
+            num_tokens=total_verify_tokens, batch_size=batch_size,
             kv_cache_size=avg_kv, is_prefill=True,
         )
         verify_per_layer = et.total_time
         tp = self._ctx.tp_size
         if tp > 1:
-            data_size = num_verify_tokens * model.embedding_dim * 2
+            data_size = total_verify_tokens * model.embedding_dim * 2
             tp_comm = self._ctx.nvlink_model.get_allreduce_time(tp, data_size) * 2
         else:
             tp_comm = 0.0
@@ -674,10 +681,11 @@ class SpeculativeDecodingEngine:
         else:
             cycle_time = draft_time + verify_time
 
+        avg_scheduled = sum(scheduled_lengths) // batch_size
         return CycleResult(
             cycle_time_ms=cycle_time,
             accepted_tokens=effective_accepted,
-            scheduled_length=scheduled_length,
+            scheduled_length=avg_scheduled,
             draft_time_ms=draft_time,
             verify_time_ms=verify_time,
             is_speculative=True,
