@@ -511,7 +511,12 @@ class SpeculativeDecodingEngine:
             self._draft_predictor = DraftModelPredictor(
                 ctx.model_config, ctx.device_config, config
             )
-            self._block_size = config.block_size
+            # 对于 "standard" 模式，使用 speculation_length 作为 block_size
+            # 对于 "dspark"/"dflash" 模式，使用 config.block_size
+            if config.speculative_mode == "standard":
+                self._block_size = config.speculation_length
+            else:
+                self._block_size = config.block_size
             self._acceptance_profile = AcceptanceProfile(config)
 
             # 加载 SPS 曲线 (profiled or synthetic)
@@ -734,7 +739,8 @@ class SpeculativeDecodingEngine:
         cond_rates = self._acceptance_profile.get_conditional_rates(primary_domain)
 
         accepted = 0
-        for k in range(self._block_size):
+        max_k = min(self._block_size, len(cond_rates))
+        for k in range(max_k):
             if self._rng.random() < cond_rates[k]:
                 accepted += 1
             else:

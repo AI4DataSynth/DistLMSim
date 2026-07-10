@@ -151,6 +151,11 @@ class AcceptanceProfile:
         Returns:
             每位置的条件接受率 [c_1, c_2, ..., c_γ]
         """
+        # 对于 "standard" 模式，使用 acceptance_rate 参数合成 profile
+        # 而不是使用内置的 DFlash profile
+        if self._mode == "standard" and not self._config.acceptance_profile_path:
+            return self._synthesize_profile()
+        
         mode_profiles = self._profiles.get(self._mode, {})
         if not mode_profiles:
             mode_profiles = self._profiles.get("standard", {})
