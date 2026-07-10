@@ -37,15 +37,21 @@ def compute_measured_per_layer_time(attn_df, mlp_df, expert_df, batch_size, num_
     单层时间 = attention 全部子阶段 + MLP/Expert + LayerNorm + 小操作
     """
     # ─── 匹配 attention 行 ─────────────────────────────────────────────
-    attn_mask = (attn_df["batch_size"] == batch_size) & (attn_df["is_prefill"] == is_prefill)
-    attn_rows = attn_df[attn_mask]
+    # Filter for TP=1 only (与模拟器默认配置一致)
+    if "num_tensor_parallel_workers" in attn_df.columns:
+        attn_df_tp1 = attn_df[attn_df["num_tensor_parallel_workers"] == 1]
+    else:
+        attn_df_tp1 = attn_df
+    
+    attn_mask = (attn_df_tp1["batch_size"] == batch_size) & (attn_df_tp1["is_prefill"] == is_prefill)
+    attn_rows = attn_df_tp1[attn_mask]
 
     if len(attn_rows) == 0:
         return None
 
     # 对 decode: 用 kv_cache_size 匹配; 对 prefill: 用 prefill_chunk_size 匹配
     if is_prefill:
-        if "prefill_chunk_size" in attn_df.columns:
+        if "prefill_chunk_size" in attn_df_tp1.columns:
             closest_idx = (attn_rows["prefill_chunk_size"] - num_tokens).abs().idxmin()
         else:
             closest_idx = attn_rows.index[0]

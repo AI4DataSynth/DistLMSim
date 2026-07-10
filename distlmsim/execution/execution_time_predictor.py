@@ -200,22 +200,26 @@ class RandomForestPredictor(ExecutionTimePredictor):
 
     def __init__(self, model_config: ModelConfig, device_config: DeviceSKUConfig, profiling_dir: str):
         from sklearn.ensemble import RandomForestRegressor
-        
+
         self._model = model_config
         self._device = device_config
         self._profiling_dir = profiling_dir
         self._fallback = AnalyticalPredictor(model_config, device_config)
-        
+
         # 模型字典：name -> RandomForestRegressor
         self._attn_models: Dict[str, RandomForestRegressor] = {}
         self._mlp_models: Dict[str, RandomForestRegressor] = {}
-        
+        # Expert MLP 模型
+        self._expert_model: Optional[RandomForestRegressor] = None
+
         # 训练模型
         self._train_attention_models()
         self._train_mlp_models()
-        
-        logger.info("RandomForestPredictor 训练完成: %d attention 子模型, %d MLP 子模型",
-                    len(self._attn_models), len(self._mlp_models))
+        self._train_expert_models()
+
+        logger.info("RandomForestPredictor 训练完成: %d attention 子模型, %d MLP 子模型, expert=%s",
+                    len(self._attn_models), len(self._mlp_models),
+                    "yes" if self._expert_model else "no")
 
     def _csv_path(self, *relative_parts: str) -> str:
         """拼接 CSV 路径。"""
@@ -234,13 +238,18 @@ class RandomForestPredictor(ExecutionTimePredictor):
             return None
 
     def _train_attention_models(self) -> None:
-        """从 attention.csv 训练 attention 子模型。"""
+        """从 attention.csv 训练 attention 子模型。只使用 TP=1 数据。"""
         from sklearn.ensemble import RandomForestRegressor
-        
+
         path = self._csv_path("attention.csv")
         df = self._load_csv(path)
         if df is None:
             return
+        
+        # Filter for TP=1 only (simulator default)
+        if "num_tensor_parallel_workers" in df.columns:
+            df = df[df["num_tensor_parallel_workers"] == 1]
+            logger.debug("Filtering attention CSV for TP=1: %d rows", len(df))
 
         # attn_prefill: 特征 = [num_tokens] (仅 is_prefill==1 行)
         target = "time_stats.attn_prefill.median"
@@ -255,15 +264,15 @@ class RandomForestPredictor(ExecutionTimePredictor):
                 self._attn_models["attn_prefill"] = model
                 logger.debug("训练 attn_prefill RF 模型: %d 样本", len(X))
 
-        # attn_decode: 特征 = [batch_size] (仅 is_prefill==0 行)
+        # attn_decode: 特征 = [batch_size, kv_cache_size] (仅 is_prefill==0 行)
         target = "time_stats.attn_decode.median"
-        if target in df.columns and "batch_size" in df.columns:
+        if target in df.columns and "batch_size" in df.columns and "kv_cache_size" in df.columns:
             mask = df["is_prefill"] == False if "is_prefill" in df.columns else slice(None)
             subset = df.loc[mask] if "is_prefill" in df.columns else df
             if len(subset) > 0:
-                X = subset[["batch_size"]].values.astype(float)
+                X = subset[["batch_size", "kv_cache_size"]].values.astype(float)
                 y = subset[target].values.astype(float)
-                model = RandomForestRegressor(n_estimators=50, max_depth=10, random_state=42)
+                model = RandomForestRegressor(n_estimators=100, max_depth=15, random_state=42)
                 model.fit(X, y)
                 self._attn_models["attn_decode"] = model
                 logger.debug("训练 attn_decode RF 模型: %d 样本", len(X))
@@ -313,6 +322,24 @@ class RandomForestPredictor(ExecutionTimePredictor):
                 self._mlp_models[name] = model
                 logger.debug("训练 MLP 子模型 %s RF: %d 样本", name, len(X))
 
+    def _train_expert_models(self) -> None:
+        """从 expert.csv 训练 expert MLP 模型。"""
+        from sklearn.ensemble import RandomForestRegressor
+
+        path = self._csv_path("expert.csv")
+        df = self._load_csv(path)
+        if df is None:
+            return
+        target = "time_stats.expert_mlp.median"
+        feature_col = "num_tokens"
+        if target in df.columns and feature_col in df.columns:
+            X = df[[feature_col]].values.astype(float)
+            y = df[target].values.astype(float)
+            model = RandomForestRegressor(n_estimators=50, max_depth=10, random_state=42)
+            model.fit(X, y)
+            self._expert_model = model
+            logger.debug("训练 expert_mlp RF 模型: %d 样本", len(X))
+
     def get_execution_time(
         self,
         num_tokens: int,
@@ -322,20 +349,21 @@ class RandomForestPredictor(ExecutionTimePredictor):
     ) -> ExecutionTime:
         """使用 RF 模型预测执行时间。"""
         result = ExecutionTime()
-        
+
         # Attention 预测
         if is_prefill and "attn_prefill" in self._attn_models:
             X = np.array([[num_tokens]], dtype=float)
             result.attn_prefill_time = float(self._attn_models["attn_prefill"].predict(X)[0])
-        
+
         if not is_prefill and "attn_decode" in self._attn_models:
-            X = np.array([[batch_size]], dtype=float)
+            # 双特征: [batch_size, kv_cache_size]
+            X = np.array([[batch_size, kv_cache_size]], dtype=float)
             result.attn_decode_time = float(self._attn_models["attn_decode"].predict(X)[0])
-        
+
         if "attn_kv_cache_save" in self._attn_models:
             X = np.array([[kv_cache_size]], dtype=float)
             result.attn_kv_cache_save_time = float(self._attn_models["attn_kv_cache_save"].predict(X)[0])
-        
+
         # MLP 预测
         X = np.array([[num_tokens]], dtype=float)
         for name, model in self._mlp_models.items():
@@ -360,11 +388,16 @@ class RandomForestPredictor(ExecutionTimePredictor):
                 result.mlp_down_proj_time = pred
             elif name == "add":
                 result.add_time = pred
-        
+
+        # Expert MLP 预测
+        if self._expert_model is not None and num_tokens > 0:
+            X = np.array([[num_tokens]], dtype=float)
+            result.expert_mlp_time = float(self._expert_model.predict(X)[0])
+
         # 如果 RF 模型未覆盖所有子模型，使用 fallback
         if result.total_time == 0.0:
             return self._fallback.get_execution_time(num_tokens, batch_size, kv_cache_size, is_prefill)
-        
+
         return result
 
 
@@ -414,9 +447,13 @@ class ProfilingBasedPredictor(ExecutionTimePredictor):
         self._fallback = AnalyticalPredictor(model_config, device_config)
 
         # 线性回归系数: {sub_model_name: (slope, intercept)}
-        self._mlp_models: Dict[str, Tuple[float, float]] = {}
+        self._mlp_models: Dict[str, Tuple[float, float, float, float]] = {}  # (small_const, slope, intercept, threshold)
         self._attn_models: Dict[str, Tuple[float, float]] = {}
         self._network_models: Dict[str, Tuple[float, float]] = {}
+        # 双特征模型: attn_decode 使用 (batch_size * kv_cache_size) 作为特征
+        self._attn_decode_model: Optional[Tuple[float, float]] = None
+        # Expert MLP 模型
+        self._expert_model: Optional[Tuple[float, float]] = None
 
         # 预测缓存: {(num_tokens, batch_size, kv_cache_size, is_prefill): ExecutionTime}
         self._cache: Dict[Tuple, ExecutionTime] = {}
@@ -451,7 +488,13 @@ class ProfilingBasedPredictor(ExecutionTimePredictor):
             return None
 
     def _train_mlp_models(self) -> None:
-        """从 mlp.csv 训练各子模型的线性回归。"""
+        """从 mlp.csv 训练各子模型的分段线性回归。
+        
+        MLP 操作在 num_tokens <= 256 时受 kernel launch overhead 主导，时间基本不变；
+        只有 num_tokens > 256 后才开始线性增长。因此使用分段模型：
+        - 小 token (<= 256): 常数（取平均值）
+        - 大 token (> 256): 线性回归
+        """
         path = self._csv_path("mlp.csv")
         df = self._load_csv(path)
         if df is None:
@@ -460,20 +503,41 @@ class ProfilingBasedPredictor(ExecutionTimePredictor):
         if feature_col not in df.columns:
             logger.warning("mlp.csv 缺少列 %s", feature_col)
             return
-        x = df[feature_col].values.astype(float)
+        
+        # 分段：小 token (<= 256) 和大 token (> 256)
+        small_mask = df[feature_col] <= 256
+        large_mask = df[feature_col] > 256
+        small_df = df[small_mask]
+        large_df = df[large_mask]
+        
         for name, target_col in self._MLP_TARGETS.items():
-            if target_col in df.columns:
-                y = df[target_col].values.astype(float)
-                self._mlp_models[name] = self._fit_linear(x, y)
-                logger.debug("训练 MLP 子模型 %s: slope=%.6f, intercept=%.6f",
-                             name, *self._mlp_models[name])
+            if target_col not in df.columns:
+                continue
+            
+            # 小 token: 常数（平均值）
+            small_const = float(small_df[target_col].mean()) if len(small_df) > 0 else 0.0
+            
+            # 大 token: 线性回归
+            if len(large_df) >= 2:
+                x_large = large_df[feature_col].values.astype(float)
+                y_large = large_df[target_col].values.astype(float)
+                slope, intercept = self._fit_linear(x_large, y_large)
+            else:
+                slope, intercept = 0.0, small_const
+            
+            # 存储分段模型: (small_const, slope, intercept, threshold)
+            self._mlp_models[name] = (small_const, slope, intercept, 256.0)
+            logger.debug("训练 MLP 子模型 %s (分段): const=%.6f (nt<=256), slope=%.6f, intercept=%.6f (nt>256)",
+                         name, small_const, slope, intercept)
 
     def _train_attention_models(self) -> None:
         """从 attention.csv 训练 attention 子模型。
 
         对 prefill: 使用 num_tokens 作为特征
-        对 decode: 使用 batch_size 作为特征
+        对 decode: 使用 batch_size * kv_cache_size 作为特征 (attention 时间与两者的乘积成正比)
         对 kv_cache_save: 使用 kv_cache_size 作为特征
+        
+        只使用 TP=1 的数据（与模拟器默认配置一致）。
         """
         import pandas as pd
 
@@ -481,6 +545,11 @@ class ProfilingBasedPredictor(ExecutionTimePredictor):
         df = self._load_csv(path)
         if df is None:
             return
+        
+        # Filter for TP=1 only (simulator default)
+        if "num_tensor_parallel_workers" in df.columns:
+            df = df[df["num_tensor_parallel_workers"] == 1]
+            logger.debug("Filtering attention CSV for TP=1: %d rows", len(df))
 
         # attn_prefill: 特征 = num_tokens (仅 is_prefill==1 行)
         target = "time_stats.attn_prefill.median"
@@ -492,15 +561,18 @@ class ProfilingBasedPredictor(ExecutionTimePredictor):
                 y = subset[target].values.astype(float)
                 self._attn_models["attn_prefill"] = self._fit_linear(x, y)
 
-        # attn_decode: 特征 = batch_size (仅 is_prefill==0 行)
+        # attn_decode: 特征 = batch_size * kv_cache_size (仅 is_prefill==0 行)
+        # Attention decode 时间 ∝ batch_size × kv_cache_size (每个 token 需要 attend 到所有 KV)
         target = "time_stats.attn_decode.median"
-        if target in df.columns and "batch_size" in df.columns:
+        if target in df.columns and "batch_size" in df.columns and "kv_cache_size" in df.columns:
             mask = df["is_prefill"] == 0 if "is_prefill" in df.columns else slice(None)
             subset = df.loc[mask] if isinstance(mask, pd.Series) else df
             if len(subset) > 0:
-                x = subset["batch_size"].values.astype(float)
+                x = (subset["batch_size"] * subset["kv_cache_size"]).values.astype(float)
                 y = subset[target].values.astype(float)
-                self._attn_models["attn_decode"] = self._fit_linear(x, y)
+                self._attn_decode_model = self._fit_linear(x, y)
+                logger.debug("训练 attn_decode 双特征模型: slope=%.10f, intercept=%.6f",
+                             *self._attn_decode_model)
 
         # attn_kv_cache_save: 特征 = kv_cache_size
         target = "time_stats.attn_kv_cache_save.median"
@@ -521,13 +593,28 @@ class ProfilingBasedPredictor(ExecutionTimePredictor):
             y = df[target].values.astype(float)
             self._network_models["all_reduce"] = self._fit_linear(x, y)
 
+    def _train_expert_models(self) -> None:
+        """从 expert.csv 训练 expert MLP 模型。特征 = num_tokens。"""
+        path = self._csv_path("expert.csv")
+        df = self._load_csv(path)
+        if df is None:
+            return
+        target = "time_stats.expert_mlp.median"
+        feature_col = "num_tokens"
+        if target in df.columns and feature_col in df.columns:
+            x = df[feature_col].values.astype(float)
+            y = df[target].values.astype(float)
+            self._expert_model = self._fit_linear(x, y)
+            logger.debug("训练 expert_mlp 模型: slope=%.6f, intercept=%.6f", *self._expert_model)
+
     def _load_and_train(self) -> None:
         """加载所有 CSV 并训练模型。"""
         self._train_mlp_models()
         self._train_attention_models()
         self._train_network_models()
+        self._train_expert_models()
 
-        if not self._mlp_models and not self._attn_models:
+        if not self._mlp_models and not self._attn_models and self._attn_decode_model is None:
             logger.warning("ProfilingBasedPredictor: 未训练任何子模型，将回退到 AnalyticalPredictor")
 
     def _predict_from_models(
@@ -540,7 +627,7 @@ class ProfilingBasedPredictor(ExecutionTimePredictor):
         """从线性回归模型预测各子阶段时间。"""
         et = ExecutionTime()
 
-        # MLP 子模型: 特征 = num_tokens
+        # MLP 子模型: 分段预测 (小 token 用常数，大 token 用线性)
         for attr, name in [
             ("attn_pre_proj_time", "attn_pre_proj"),
             ("mlp_up_proj_time", "mlp_up_proj"),
@@ -553,21 +640,31 @@ class ProfilingBasedPredictor(ExecutionTimePredictor):
             ("add_time", "add"),
         ]:
             if name in self._mlp_models:
-                slope, intercept = self._mlp_models[name]
-                setattr(et, attr, self._predict_linear(slope, intercept, num_tokens))
+                small_const, slope, intercept, threshold = self._mlp_models[name]
+                if num_tokens <= threshold:
+                    setattr(et, attr, small_const)
+                else:
+                    setattr(et, attr, self._predict_linear(slope, intercept, num_tokens))
 
         # Attention prefill/decode
         if is_prefill and "attn_prefill" in self._attn_models:
             slope, intercept = self._attn_models["attn_prefill"]
             et.attn_prefill_time = self._predict_linear(slope, intercept, num_tokens)
-        elif not is_prefill and "attn_decode" in self._attn_models:
-            slope, intercept = self._attn_models["attn_decode"]
-            et.attn_decode_time = self._predict_linear(slope, intercept, batch_size)
+        elif not is_prefill and self._attn_decode_model is not None:
+            # 双特征: batch_size * kv_cache_size
+            slope, intercept = self._attn_decode_model
+            feature = float(batch_size * kv_cache_size)
+            et.attn_decode_time = self._predict_linear(slope, intercept, feature)
 
         # KV cache save
         if "attn_kv_cache_save" in self._attn_models:
             slope, intercept = self._attn_models["attn_kv_cache_save"]
             et.attn_kv_cache_save_time = self._predict_linear(slope, intercept, kv_cache_size)
+
+        # Expert MLP
+        if self._expert_model is not None and num_tokens > 0:
+            slope, intercept = self._expert_model
+            et.expert_mlp_time = self._predict_linear(slope, intercept, num_tokens)
 
         return et
 
