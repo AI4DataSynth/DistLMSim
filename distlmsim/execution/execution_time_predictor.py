@@ -722,8 +722,10 @@ class HighFidelityPredictor(ExecutionTimePredictor):
 
     支持 kernel fusion 校正：profiling 分别测量每个子操作（各有 kernel launch
     overhead），但生产框架（如 vLLM）使用 kernel fusion 合并多个子操作。
-    通过 fusion_factor (0-1) 缩放 MLP 子操作时间以模拟融合效果。
-    默认 0.55（基于 H100 校准：profiling 子操作总和 / vLLM 实测 ≈ 1.9x）。
+    通过双 fusion factor 分别校正 prefill 和 decode 阶段：
+    - prefill_fusion_factor (默认 0.90): prefill 阶段主要是大矩阵乘法，fusion 收益小
+    - decode_fusion_factor (默认 0.55): decode 阶段主要是小矩阵乘法+内存访问，fusion 收益大
+    两个因子可独立校准，基于 H100 实测数据优化。
 
     此模式适用于对精度要求极高的场景（如论文验证、生产部署规划）。
     """
@@ -746,14 +748,30 @@ class HighFidelityPredictor(ExecutionTimePredictor):
         model_config: ModelConfig,
         device_config: DeviceSKUConfig,
         profiling_dir: str,
-        fusion_factor: float = 0.55,
+        prefill_fusion_factor: float = 0.90,
+        decode_fusion_factor: float = 0.55,
+        fusion_factor: float = None,
     ):
         import pandas as pd
 
         self._model = model_config
         self._device = device_config
         self._profiling_dir = profiling_dir
-        self._fusion_factor = fusion_factor  # kernel fusion 校正因子
+        # 支持旧的单一 fusion_factor 参数（向后兼容）
+        if fusion_factor is not None:
+            self._prefill_fusion_factor = fusion_factor
+            self._decode_fusion_factor = fusion_factor
+        else:
+            self._prefill_fusion_factor = prefill_fusion_factor
+            self._decode_fusion_factor = decode_fusion_factor
+        # Size-dependent fusion scaling: kernel fusion benefit increases with
+        # larger batch/token sizes. Calibrated from H100 vLLM measurements:
+        #   pf=512 → fusion=0.85, pf=1024 → fusion=0.51
+        # Model: fusion(size) = base_fusion * (size / ref_size) ^ (-alpha)
+        # where ref_size=512 for prefill, ref_size=1 for decode, alpha=0.75
+        self._fusion_alpha = 0.75
+        self._prefill_ref_size = 512
+        self._decode_ref_size = 1
         self._fallback = ProfilingBasedPredictor(model_config, device_config, profiling_dir)
 
         # 加载 profiling CSV
@@ -823,6 +841,18 @@ class HighFidelityPredictor(ExecutionTimePredictor):
         """从 profiling CSV 精确查表。"""
         import pandas as pd
 
+        # 根据阶段计算 fusion factor
+        # Prefill: size-dependent fusion (larger prefill → more fusion benefit)
+        # Decode: fixed fusion (batch size varies in continuous batching, hard to model)
+        if is_prefill:
+            base_fusion = self._prefill_fusion_factor
+            ref_size = self._prefill_ref_size
+            size = max(num_tokens, 1)
+            fusion = base_fusion * (size / ref_size) ** (-self._fusion_alpha)
+            fusion = max(0.1, min(fusion, 1.0))
+        else:
+            fusion = self._decode_fusion_factor
+
         et = ExecutionTime()
         found_any = False
 
@@ -859,19 +889,50 @@ class HighFidelityPredictor(ExecutionTimePredictor):
                         if name == "attn_input_reshape":
                             et.attn_input_reshape_time = val
                         elif name == "attn_kv_cache_save":
-                            et.attn_kv_cache_save_time = val * self._fusion_factor
+                            et.attn_kv_cache_save_time = val * fusion
                         elif name == "attn_decode" and not is_prefill:
-                            et.attn_decode_time = val * self._fusion_factor
+                            et.attn_decode_time = val * fusion
                         elif name == "attn_prefill" and is_prefill:
-                            et.attn_prefill_time = val * self._fusion_factor
+                            et.attn_prefill_time = val * fusion
                         elif name == "attn_output_reshape":
                             et.attn_output_reshape_time = val
                 found_any = True
 
-        # ─── MLP 查表 ──────────────────────────────────────────────────
+        # ─── MLP 查表 (支持 log-linear 插值) ─────────────────────────
         if self._mlp_df is not None:
-            closest_idx = (self._mlp_df["num_tokens"] - num_tokens).abs().idxmin()
-            mlp_row = self._mlp_df.loc[closest_idx]
+            nt_values = self._mlp_df["num_tokens"].values
+            closest_nt = nt_values[np.argmin(np.abs(nt_values - num_tokens))]
+            
+            # 如果精确匹配，直接查表
+            if closest_nt == num_tokens:
+                closest_idx = (self._mlp_df["num_tokens"] - num_tokens).abs().idxmin()
+                mlp_row = self._mlp_df.loc[closest_idx]
+            else:
+                # Log-linear 插值: 找到上下界
+                lower_nts = nt_values[nt_values < num_tokens]
+                upper_nts = nt_values[nt_values > num_tokens]
+                
+                if len(lower_nts) > 0 and len(upper_nts) > 0:
+                    lower_nt = lower_nts.max()
+                    upper_nt = upper_nts.min()
+                    lower_row = self._mlp_df[self._mlp_df["num_tokens"] == lower_nt].iloc[0]
+                    upper_row = self._mlp_df[self._mlp_df["num_tokens"] == upper_nt].iloc[0]
+                    
+                    # Log-linear 插值权重
+                    log_ratio = (np.log(num_tokens) - np.log(lower_nt)) / (np.log(upper_nt) - np.log(lower_nt))
+                    
+                    # 对每个子操作插值
+                    mlp_row = lower_row.copy()
+                    for col in self._mlp_df.columns:
+                        if col.startswith("time_stats.") and col.endswith(".mean"):
+                            if not pd.isna(lower_row[col]) and not pd.isna(upper_row[col]):
+                                lower_val = float(lower_row[col])
+                                upper_val = float(upper_row[col])
+                                interp_val = lower_val * (1 - log_ratio) + upper_val * log_ratio
+                                mlp_row[col] = interp_val
+                else:
+                    closest_idx = (self._mlp_df["num_tokens"] - num_tokens).abs().idxmin()
+                    mlp_row = self._mlp_df.loc[closest_idx]
 
             mlp_cols = {
                 "input_layernorm": "time_stats.input_layernorm.mean",
@@ -886,7 +947,7 @@ class HighFidelityPredictor(ExecutionTimePredictor):
             }
             for name, col in mlp_cols.items():
                 if col in mlp_row.index and not pd.isna(mlp_row[col]):
-                    val = float(mlp_row[col]) * self._fusion_factor
+                    val = float(mlp_row[col]) * fusion
                     if name == "input_layernorm":
                         et.input_layernorm_time = val
                     elif name == "attn_pre_proj":
@@ -912,7 +973,7 @@ class HighFidelityPredictor(ExecutionTimePredictor):
             closest_idx = (self._expert_df["num_tokens"] - num_tokens).abs().idxmin()
             expert_row = self._expert_df.loc[closest_idx]
             if "time_stats.expert_mlp.mean" in expert_row.index and not pd.isna(expert_row["time_stats.expert_mlp.mean"]):
-                et.expert_mlp_time = float(expert_row["time_stats.expert_mlp.mean"]) * self._fusion_factor
+                et.expert_mlp_time = float(expert_row["time_stats.expert_mlp.mean"]) * fusion
                 found_any = True
 
         # 如果没有找到任何数据，回退到 ProfilingBasedPredictor
