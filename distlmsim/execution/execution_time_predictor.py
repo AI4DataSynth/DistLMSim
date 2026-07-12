@@ -713,6 +713,208 @@ class ProfilingBasedPredictor(ExecutionTimePredictor):
         logger.info("预计算缓存完成，共 %d 条", len(self._cache))
 
 
+class HighFidelityPredictor(ExecutionTimePredictor):
+    """高保真预测器：直接从 profiling CSV 查表，无回归、无插值。
+
+    对于每个 (batch_size, kv_cache_size, num_tokens, is_prefill) 组合，
+    直接在 profiling CSV 中找到最接近的匹配行，返回其测量值。
+    仅当精确匹配不存在时，才回退到 ProfilingBasedPredictor。
+
+    此模式适用于对精度要求极高的场景（如论文验证、生产部署规划）。
+    """
+
+    # MLP 子操作名称 -> CSV 目标列
+    _MLP_TARGETS: Dict[str, str] = {
+        "attn_pre_proj": "time_stats.attn_pre_proj.median",
+        "mlp_up_proj": "time_stats.mlp_up_proj.median",
+        "mlp_act": "time_stats.mlp_act.median",
+        "mlp_down_proj": "time_stats.mlp_down_proj.median",
+        "attn_post_proj": "time_stats.attn_post_proj.median",
+        "attn_rope": "time_stats.attn_rope.median",
+        "input_layernorm": "time_stats.input_layernorm.median",
+        "post_attention_layernorm": "time_stats.post_attention_layernorm.median",
+        "add": "time_stats.add.median",
+    }
+
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        device_config: DeviceSKUConfig,
+        profiling_dir: str,
+    ):
+        import pandas as pd
+
+        self._model = model_config
+        self._device = device_config
+        self._profiling_dir = profiling_dir
+        self._fallback = ProfilingBasedPredictor(model_config, device_config, profiling_dir)
+
+        # 加载 profiling CSV
+        base = os.path.join(profiling_dir, "compute", "a800",
+                            model_config.model_name.replace("-", "/") if "/" not in model_config.model_name
+                            else model_config.model_name)
+        # 尝试多种路径格式
+        for candidate in [
+            base,
+            os.path.join(profiling_dir, "compute", "a800", "Qwen", model_config.model_name),
+        ]:
+            if os.path.isdir(candidate):
+                base = candidate
+                break
+
+        # 加载 attention CSV (filter TP=1)
+        attn_path = os.path.join(base, "attention.csv")
+        self._attn_df = None
+        if os.path.exists(attn_path):
+            self._attn_df = pd.read_csv(attn_path)
+            if "num_tensor_parallel_workers" in self._attn_df.columns:
+                self._attn_df = self._attn_df[self._attn_df["num_tensor_parallel_workers"] == 1]
+
+        # 加载 mlp CSV
+        mlp_path = os.path.join(base, "mlp.csv")
+        self._mlp_df = None
+        if os.path.exists(mlp_path):
+            self._mlp_df = pd.read_csv(mlp_path)
+
+        # 加载 expert CSV
+        expert_path = os.path.join(base, "expert.csv")
+        self._expert_df = None
+        if os.path.exists(expert_path):
+            self._expert_df = pd.read_csv(expert_path)
+
+        # 缓存
+        self._cache: Dict[Tuple, ExecutionTime] = {}
+
+        attn_rows = len(self._attn_df) if self._attn_df is not None else 0
+        mlp_rows = len(self._mlp_df) if self._mlp_df is not None else 0
+        expert_rows = len(self._expert_df) if self._expert_df is not None else 0
+        logger.info("HighFidelityPredictor 初始化: %d attention, %d MLP, %d expert 行",
+                     attn_rows, mlp_rows, expert_rows)
+
+    def get_execution_time(
+        self,
+        num_tokens: int,
+        batch_size: int,
+        kv_cache_size: int,
+        is_prefill: bool = False,
+    ) -> ExecutionTime:
+        cache_key = (num_tokens, batch_size, kv_cache_size, is_prefill)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        et = self._lookup(num_tokens, batch_size, kv_cache_size, is_prefill)
+        self._cache[cache_key] = et
+        return et
+
+    def _lookup(
+        self,
+        num_tokens: int,
+        batch_size: int,
+        kv_cache_size: int,
+        is_prefill: bool,
+    ) -> ExecutionTime:
+        """从 profiling CSV 精确查表。"""
+        import pandas as pd
+
+        et = ExecutionTime()
+        found_any = False
+
+        # ─── Attention 查表 ─────────────────────────────────────────────
+        if self._attn_df is not None:
+            attn_mask = (
+                (self._attn_df["batch_size"] == batch_size)
+                & (self._attn_df["is_prefill"] == is_prefill)
+            )
+            attn_rows = self._attn_df[attn_mask]
+
+            if len(attn_rows) > 0:
+                if is_prefill:
+                    if "prefill_chunk_size" in self._attn_df.columns:
+                        closest_idx = (attn_rows["prefill_chunk_size"] - num_tokens).abs().idxmin()
+                    else:
+                        closest_idx = attn_rows.index[0]
+                else:
+                    closest_idx = (attn_rows["kv_cache_size"] - kv_cache_size).abs().idxmin()
+
+                row = attn_rows.loc[closest_idx]
+
+                # 提取 attention 子操作
+                attn_cols = {
+                    "attn_input_reshape": "time_stats.attn_input_reshape.mean",
+                    "attn_kv_cache_save": "time_stats.attn_kv_cache_save.mean",
+                    "attn_decode": "time_stats.attn_decode.mean",
+                    "attn_prefill": "time_stats.attn_prefill.mean",
+                    "attn_output_reshape": "time_stats.attn_output_reshape.mean",
+                }
+                for name, col in attn_cols.items():
+                    if col in row.index and not pd.isna(row[col]):
+                        val = float(row[col])
+                        if name == "attn_input_reshape":
+                            pass  # 忽略 reshape
+                        elif name == "attn_kv_cache_save":
+                            et.attn_kv_cache_save_time = val
+                        elif name == "attn_decode" and not is_prefill:
+                            et.attn_decode_time = val
+                        elif name == "attn_prefill" and is_prefill:
+                            et.attn_prefill_time = val
+                        elif name == "attn_output_reshape":
+                            pass  # 忽略 reshape
+                found_any = True
+
+        # ─── MLP 查表 ──────────────────────────────────────────────────
+        if self._mlp_df is not None:
+            closest_idx = (self._mlp_df["num_tokens"] - num_tokens).abs().idxmin()
+            mlp_row = self._mlp_df.loc[closest_idx]
+
+            mlp_cols = {
+                "input_layernorm": "time_stats.input_layernorm.mean",
+                "attn_pre_proj": "time_stats.attn_pre_proj.mean",
+                "attn_rope": "time_stats.attn_rope.mean",
+                "attn_post_proj": "time_stats.attn_post_proj.mean",
+                "post_attention_layernorm": "time_stats.post_attention_layernorm.mean",
+                "mlp_up_proj": "time_stats.mlp_up_proj.mean",
+                "mlp_act": "time_stats.mlp_act.mean",
+                "mlp_down_proj": "time_stats.mlp_down_proj.mean",
+                "add": "time_stats.add.mean",
+            }
+            for name, col in mlp_cols.items():
+                if col in mlp_row.index and not pd.isna(mlp_row[col]):
+                    val = float(mlp_row[col])
+                    if name == "input_layernorm":
+                        et.input_layernorm_time = val
+                    elif name == "attn_pre_proj":
+                        et.attn_pre_proj_time = val
+                    elif name == "attn_rope":
+                        et.attn_rope_time = val
+                    elif name == "attn_post_proj":
+                        et.attn_post_proj_time = val
+                    elif name == "post_attention_layernorm":
+                        et.post_attention_layernorm_time = val
+                    elif name == "mlp_up_proj":
+                        et.mlp_up_proj_time = val
+                    elif name == "mlp_act":
+                        et.mlp_act_time = val
+                    elif name == "mlp_down_proj":
+                        et.mlp_down_proj_time = val
+                    elif name == "add":
+                        et.add_time = val
+            found_any = True
+
+        # ─── Expert MLP 查表 ───────────────────────────────────────────
+        if self._expert_df is not None:
+            closest_idx = (self._expert_df["num_tokens"] - num_tokens).abs().idxmin()
+            expert_row = self._expert_df.loc[closest_idx]
+            if "time_stats.expert_mlp.mean" in expert_row.index and not pd.isna(expert_row["time_stats.expert_mlp.mean"]):
+                et.expert_mlp_time = float(expert_row["time_stats.expert_mlp.mean"])
+                found_any = True
+
+        # 如果没有找到任何数据，回退到 ProfilingBasedPredictor
+        if not found_any:
+            return self._fallback.get_execution_time(num_tokens, batch_size, kv_cache_size, is_prefill)
+
+        return et
+
+
 def create_predictor(
     model_config: ModelConfig,
     device_config: DeviceSKUConfig,
@@ -725,11 +927,12 @@ def create_predictor(
         model_config: 模型配置
         device_config: 设备配置
         profiling_dir: profiling 数据目录路径（可选）
-        predictor_type: 预测器类型 ("auto", "analytical", "profiled", "random_forest")
+        predictor_type: 预测器类型 ("auto", "analytical", "profiled", "random_forest", "high_fidelity")
             - "auto": 根据 profiling_dir 自动选择（默认）
             - "analytical": 强制使用 AnalyticalPredictor
             - "profiled": 强制使用 ProfilingBasedPredictor（需要 profiling_dir）
             - "random_forest": 强制使用 RandomForestPredictor（需要 profiling_dir）
+            - "high_fidelity": 使用 HighFidelityPredictor（精确查表，需要 profiling_dir）
 
     Returns:
         ExecutionTimePredictor 实例
@@ -746,21 +949,28 @@ def create_predictor(
     if predictor_type == "analytical":
         logger.info("使用 AnalyticalPredictor（强制）")
         return AnalyticalPredictor(model_config, device_config)
-    
+
     elif predictor_type == "profiled":
         if not has_csv:
             logger.warning("请求 ProfilingBasedPredictor 但 profiling 目录无效，回退到 AnalyticalPredictor")
             return AnalyticalPredictor(model_config, device_config)
         logger.info("使用 ProfilingBasedPredictor，数据目录: %s", profiling_dir)
         return ProfilingBasedPredictor(model_config, device_config, profiling_dir)
-    
+
     elif predictor_type == "random_forest":
         if not has_csv:
             logger.warning("请求 RandomForestPredictor 但 profiling 目录无效，回退到 AnalyticalPredictor")
             return AnalyticalPredictor(model_config, device_config)
         logger.info("使用 RandomForestPredictor，数据目录: %s", profiling_dir)
         return RandomForestPredictor(model_config, device_config, profiling_dir)
-    
+
+    elif predictor_type == "high_fidelity":
+        if not has_csv:
+            logger.warning("请求 HighFidelityPredictor 但 profiling 目录无效，回退到 AnalyticalPredictor")
+            return AnalyticalPredictor(model_config, device_config)
+        logger.info("使用 HighFidelityPredictor（精确查表模式），数据目录: %s", profiling_dir)
+        return HighFidelityPredictor(model_config, device_config, profiling_dir)
+
     else:  # auto
         if has_csv:
             logger.info("自动选择 ProfilingBasedPredictor，数据目录: %s", profiling_dir)

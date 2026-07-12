@@ -1418,7 +1418,7 @@ def create_colocated_simulator(
     
     Args:
         profiling_dir: profiling 数据目录路径（可选）
-        predictor_type: 预测器类型 ("auto", "analytical", "profiled", "random_forest")
+        predictor_type: 预测器类型 ("auto", "analytical", "profiled", "random_forest", "high_fidelity")
     """
     from distlmsim.types import RDMAProtocolType
 
@@ -1502,7 +1502,7 @@ def create_disaggregated_simulator(
     
     Args:
         profiling_dir: profiling 数据目录路径（可选）
-        predictor_type: 预测器类型 ("auto", "analytical", "profiled", "random_forest")
+        predictor_type: 预测器类型 ("auto", "analytical", "profiled", "random_forest", "high_fidelity")
     """
     from distlmsim.types import RDMAProtocolType
 
