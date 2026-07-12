@@ -867,13 +867,44 @@ class HighFidelityPredictor(ExecutionTimePredictor):
             if len(attn_rows) > 0:
                 if is_prefill:
                     if "prefill_chunk_size" in self._attn_df.columns:
-                        closest_idx = (attn_rows["prefill_chunk_size"] - num_tokens).abs().idxmin()
+                        # Log-linear interpolation for prefill attention
+                        # (attention scales quadratically with sequence length)
+                        pcs_values = attn_rows["prefill_chunk_size"].values
+                        closest_pcs = pcs_values[np.argmin(np.abs(pcs_values - num_tokens))]
+                        
+                        if closest_pcs == num_tokens:
+                            closest_idx = (attn_rows["prefill_chunk_size"] - num_tokens).abs().idxmin()
+                            row = attn_rows.loc[closest_idx]
+                        else:
+                            lower_pcs = pcs_values[pcs_values < num_tokens]
+                            upper_pcs = pcs_values[pcs_values > num_tokens]
+                            
+                            if len(lower_pcs) > 0 and len(upper_pcs) > 0:
+                                lower_val = lower_pcs.max()
+                                upper_val = upper_pcs.min()
+                                lower_row = attn_rows[attn_rows["prefill_chunk_size"] == lower_val].iloc[0]
+                                upper_row = attn_rows[attn_rows["prefill_chunk_size"] == upper_val].iloc[0]
+                                
+                                # Log-linear interpolation weight
+                                log_ratio = (np.log(num_tokens) - np.log(lower_val)) / (np.log(upper_val) - np.log(lower_val))
+                                
+                                # Interpolate each attention sub-operation
+                                row = lower_row.copy()
+                                for col in attn_rows.columns:
+                                    if col.startswith("time_stats.") and col.endswith(".mean"):
+                                        if not pd.isna(lower_row[col]) and not pd.isna(upper_row[col]):
+                                            lv = float(lower_row[col])
+                                            uv = float(upper_row[col])
+                                            row[col] = lv * (1 - log_ratio) + uv * log_ratio
+                            else:
+                                closest_idx = (attn_rows["prefill_chunk_size"] - num_tokens).abs().idxmin()
+                                row = attn_rows.loc[closest_idx]
                     else:
                         closest_idx = attn_rows.index[0]
+                        row = attn_rows.loc[closest_idx]
                 else:
                     closest_idx = (attn_rows["kv_cache_size"] - kv_cache_size).abs().idxmin()
-
-                row = attn_rows.loc[closest_idx]
+                    row = attn_rows.loc[closest_idx]
 
                 # 提取 attention 子操作
                 attn_cols = {
