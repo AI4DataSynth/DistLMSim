@@ -31,12 +31,14 @@ class ExecutionTime:
     记录模型前向传播中各子阶段的执行时间（单位：ms）。
     """
     # Attention 子阶段
+    attn_input_reshape_time: float = 0.0
     attn_pre_proj_time: float = 0.0
     attn_rope_time: float = 0.0
     attn_kv_cache_save_time: float = 0.0
     attn_prefill_time: float = 0.0
     attn_decode_time: float = 0.0
     attn_post_proj_time: float = 0.0
+    attn_output_reshape_time: float = 0.0
     # MLP 子阶段
     mlp_up_proj_time: float = 0.0
     mlp_act_time: float = 0.0
@@ -59,12 +61,14 @@ class ExecutionTime:
     @property
     def attention_time(self) -> float:
         return (
-            self.attn_pre_proj_time
+            self.attn_input_reshape_time
+            + self.attn_pre_proj_time
             + self.attn_rope_time
             + self.attn_kv_cache_save_time
             + self.attn_prefill_time
             + self.attn_decode_time
             + self.attn_post_proj_time
+            + self.attn_output_reshape_time
         )
 
     @property

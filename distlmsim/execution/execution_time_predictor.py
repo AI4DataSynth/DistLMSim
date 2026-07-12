@@ -857,7 +857,7 @@ class HighFidelityPredictor(ExecutionTimePredictor):
                     if col in row.index and not pd.isna(row[col]):
                         val = float(row[col])
                         if name == "attn_input_reshape":
-                            pass  # 忽略 reshape
+                            et.attn_input_reshape_time = val
                         elif name == "attn_kv_cache_save":
                             et.attn_kv_cache_save_time = val * self._fusion_factor
                         elif name == "attn_decode" and not is_prefill:
@@ -865,7 +865,7 @@ class HighFidelityPredictor(ExecutionTimePredictor):
                         elif name == "attn_prefill" and is_prefill:
                             et.attn_prefill_time = val * self._fusion_factor
                         elif name == "attn_output_reshape":
-                            pass  # 忽略 reshape
+                            et.attn_output_reshape_time = val
                 found_any = True
 
         # ─── MLP 查表 ──────────────────────────────────────────────────
