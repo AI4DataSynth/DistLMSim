@@ -218,6 +218,8 @@ class RequestGeneratorConfig:
     length_distribution: str = "normal"  # fixed, normal, lognormal
     length_generator_type: str = "normal"  # fixed, normal, zipf
     length_cv: float = 0.3              # 变异系数 (normal/lognormal)
+    prefill_length_cv: float = -1.0     # prefill 专用 CV (-1 = 使用 length_cv)
+    decode_length_cv: float = -1.0      # decode 专用 CV (-1 = 使用 length_cv)
     zipf_alpha: float = 1.5             # Zipf 分布 alpha 参数 (zipf 模式)
 
 

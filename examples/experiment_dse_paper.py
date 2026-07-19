@@ -94,8 +94,14 @@ def create_simulator(
     chunk_size: int,
     seed: int = 42,
     time_limit_s: float = 30.0,
+    workload: str = None,
 ) -> DisaggregatedSimulator:
-    """创建带自定义配置的 DisaggregatedSimulator。"""
+    """创建带自定义配置的 DisaggregatedSimulator。
+
+    Args:
+        workload: Vidur workload name ("chat-1m", "arxiv-4k", "bwb-4k").
+                  If specified, overrides default prefill/decode/CV.
+    """
 
     device = DeviceSKUConfig()  # A800 defaults
     model = ModelConfig(
@@ -147,6 +153,11 @@ def create_simulator(
         ),
         metrics=metrics_config,
     )
+
+    # Apply Vidur workload if specified
+    if workload:
+        from distlmsim.workloads import apply_workload
+        apply_workload(config, workload)
 
     return DisaggregatedSimulator(
         ctx, config,
@@ -212,8 +223,12 @@ def find_pareto_frontier(
 
 # ─── 主实验 ────────────────────────────────────────────────────────────────────
 
-def run_experiment() -> List[DSEResult]:
-    """运行完整的 DSE 扫描。"""
+def run_experiment(workload: str = None) -> List[DSEResult]:
+    """运行完整的 DSE 扫描。
+
+    Args:
+        workload: Vidur workload name ("chat-1m", "arxiv-4k", "bwb-4k").
+    """
     all_results: List[DSEResult] = []
     total = (
         len(SCHEDULERS) * len(KV_TRANSFER_STRATEGIES)
@@ -242,6 +257,7 @@ def run_experiment() -> List[DSEResult]:
                 kv_transfer=kv_transfer,
                 chunked_prefill_enabled=chunk_cfg["enabled"],
                 chunk_size=chunk_cfg["chunk_size"],
+                workload=workload,
             )
             ms = sim.run()
             metrics = extract_metrics(ms)
@@ -544,13 +560,27 @@ def save_results_json(results: List[DSEResult], pareto: List[DSEResult], output_
 # ─── 入口 ──────────────────────────────────────────────────────────────────────
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="DistLMSim DSE")
+    parser.add_argument("--workload", type=str, default=None,
+                        choices=["chat-1m", "arxiv-4k", "bwb-4k", "default"],
+                        help="Vidur workload trace")
+    parser.add_argument("--time_limit", type=float, default=30.0)
+    args = parser.parse_args()
+
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 
     print()
     print("  DistLMSim Design Space Exploration (DSE)")
     print(f"  模型:   Qwen3-30B-A3B (48 layers, 128 experts, top-8)")
     print(f"  集群:   1P(4xA800 TP=4) + 1D(4xA800 TP=4)")
-    print(f"  请求:   prefill=512, decode=128 (lognormal, cv=0.5)")
+    if args.workload:
+        from distlmsim.workloads import VIDUR_WORKLOADS
+        wl = VIDUR_WORKLOADS[args.workload]
+        print(f"  Workload: {wl.name} (pf={wl.prefill_mean}, dc={wl.decode_mean}, "
+              f"P:D={wl.pd_ratio:.2f})")
+    else:
+        print(f"  请求:   prefill=512, decode=128 (lognormal, cv=0.5)")
     print()
     print(f"  搜索维度:")
     print(f"    调度策略:      {SCHEDULERS}")
@@ -562,7 +592,7 @@ def main():
     print()
 
     # 运行实验
-    results = run_experiment()
+    results = run_experiment(workload=args.workload)
 
     # Pareto 分析
     pareto = find_pareto_frontier(results, x_key="ttft_p50", y_key="tbt_p50")

@@ -113,6 +113,8 @@ def run_one(
         prefill_schedule_policy=scheduler_key,
         decode_schedule_policy=scheduler_key,
         length_distribution="normal",
+        length_cv=args.length_cv,
+        workload=args.workload,
     )
     metrics = sim.run()
 
@@ -227,6 +229,9 @@ def main():
                         help="多种子 (逗号分隔, 取平均)")
     parser.add_argument("--length_cv", type=float, default=0.5,
                         help="请求长度变异系数 (越大调度差异越大)")
+    parser.add_argument("--workload", type=str, default=None,
+                        choices=["chat-1m", "arxiv-4k", "bwb-4k", "default"],
+                        help="Vidur workload trace (覆盖 prefill/decode/CV 参数)")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -240,8 +245,15 @@ def main():
     print(f"  模型:   Qwen3-30B-A3B (48 层, MoE)")
     print(f"  集群:   1 Prefill (4×A800 TP=4) + 1 Decode (4×A800 TP=4)")
     print(f"  互联:   NVLink 600GB/s + RDMA RoCEv2 200Gb/s")
-    print(f"  请求:   prefill={args.prefill_length}±{int(args.prefill_length*args.length_cv)}, "
-          f"decode={args.decode_length}±{int(args.decode_length*args.length_cv)} (normal, CV={args.length_cv})")
+    if args.workload:
+        from distlmsim.workloads import VIDUR_WORKLOADS
+        wl = VIDUR_WORKLOADS[args.workload]
+        print(f"  Workload: {wl.name} (pf={wl.prefill_mean}±{wl.prefill_std:.0f}, "
+              f"dc={wl.decode_mean}±{wl.decode_std:.0f}, P:D={wl.pd_ratio:.2f})")
+        print(f"            {wl.description}")
+    else:
+        print(f"  请求:   prefill={args.prefill_length}±{int(args.prefill_length*args.length_cv)}, "
+              f"decode={args.decode_length}±{int(args.decode_length*args.length_cv)} (normal, CV={args.length_cv})")
     print(f"  QPS={args.qps}  prefill_bs={args.prefill_batch_size}  "
           f"decode_bs={args.decode_batch_size}  时长={args.time_limit}s")
     print(f"  种子:   {seeds}")

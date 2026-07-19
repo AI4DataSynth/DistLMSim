@@ -5,6 +5,7 @@
 1. 算子级精度对比 (4 predictors × aggregate + per-operator-type)
 2. E2E 泛化验证 (7 configs vs vLLM on H100)
 3. Per-operator-type accuracy breakdown
+4. RandomForest held-out 评估 (70/30 train/test split, 5-fold CV)
 
 输出:
   - results/highfidelity_paper.json (整合数据)
@@ -155,6 +156,161 @@ def run_operator_level_comparison():
             })
 
     return all_results
+
+
+def run_rf_held_out_evaluation():
+    """RandomForest held-out 评估: 70/30 train/test split + 5-fold CV。
+
+    解决审稿意见 W4: RF 在同一数据集上训练和测试，无泛化性验证。
+    本函数报告 test-set MAPE 而非 train-set MAPE。
+    """
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.model_selection import KFold
+
+    model = ModelConfig(
+        model_name=MODEL_NAME,
+        num_layers=48, num_q_heads=32, num_kv_heads=4,
+        embedding_dim=2048, num_experts=128, top_k_experts=8,
+    )
+    device = DeviceSKUConfig()
+
+    base = os.path.join(PROFILING_DIR, "compute", "a800", "Qwen", MODEL_NAME)
+    attn_df = pd.read_csv(os.path.join(base, "attention.csv"))
+    mlp_df = pd.read_csv(os.path.join(base, "mlp.csv"))
+    expert_df = pd.read_csv(os.path.join(base, "expert.csv"))
+
+    # MLP: 计算总时间 (子操作求和)
+    mlp_sub_cols = ["time_stats.mlp_up_proj.median", "time_stats.mlp_act.median", "time_stats.mlp_down_proj.median"]
+    mlp_available = [c for c in mlp_sub_cols if c in mlp_df.columns]
+    if mlp_available:
+        mlp_df["_mlp_total"] = mlp_df[mlp_available].sum(axis=1)
+
+    results = {"train_test_split": {}, "cross_validation": {}}
+
+    # ─── 70/30 Train/Test Split ───────────────────────────────────────────
+    def evaluate_split(df, feature_cols, target_col, filter_fn=None, label="", min_target=0.1):
+        """对单个算子类型做 70/30 split 评估。"""
+        if filter_fn is not None:
+            df = filter_fn(df)
+        if target_col not in df.columns or len(df) < 10:
+            return None
+
+        # 过滤掉目标值过小的样本 (MAPE 对接近零的值无意义)
+        df = df[df[target_col] >= min_target]
+        if len(df) < 10:
+            return None
+
+        X = df[feature_cols].values.astype(float)
+        y = df[target_col].values.astype(float)
+
+        # 70/30 split
+        n_train = int(len(X) * 0.7)
+        indices = np.random.RandomState(42).permutation(len(X))
+        train_idx, test_idx = indices[:n_train], indices[n_train:]
+
+        rf = RandomForestRegressor(n_estimators=50, max_depth=10, random_state=42)
+        rf.fit(X[train_idx], y[train_idx])
+
+        train_pred = rf.predict(X[train_idx])
+        test_pred = rf.predict(X[test_idx])
+
+        train_mape = np.mean(np.abs(train_pred - y[train_idx]) / np.maximum(y[train_idx], 0.01)) * 100
+        test_mape = np.mean(np.abs(test_pred - y[test_idx]) / np.maximum(y[test_idx], 0.01)) * 100
+
+        return {
+            "label": label,
+            "n_total": len(X),
+            "n_train": n_train,
+            "n_test": len(X) - n_train,
+            "train_mape": round(train_mape, 2),
+            "test_mape": round(test_mape, 2),
+        }
+
+    # Attention decode: features = [batch_size, kv_cache_size]
+    r = evaluate_split(
+        attn_df, ["batch_size", "kv_cache_size"],
+        "time_stats.attn_decode.median",
+        filter_fn=lambda d: d[d["is_prefill"] == False] if "is_prefill" in d.columns else d,
+        label="attn_decode"
+    )
+    if r:
+        results["train_test_split"]["attn_decode"] = r
+
+    # Attention prefill: features = [prefill_chunk_size]
+    prefill_feat = ["prefill_chunk_size"] if "prefill_chunk_size" in attn_df.columns else ["batch_size"]
+    r = evaluate_split(
+        attn_df, prefill_feat,
+        "time_stats.attn_prefill.median",
+        filter_fn=lambda d: d[d["is_prefill"] == True] if "is_prefill" in d.columns else d,
+        label="attn_prefill"
+    )
+    if r:
+        results["train_test_split"]["attn_prefill"] = r
+
+    # MLP
+    if "_mlp_total" in mlp_df.columns:
+        r = evaluate_split(mlp_df, ["num_tokens"], "_mlp_total", label="mlp")
+        if r:
+            results["train_test_split"]["mlp"] = r
+
+    # Expert MLP
+    if "time_stats.expert_mlp.median" in expert_df.columns:
+        r = evaluate_split(
+            expert_df, ["num_tokens", "batch_size"],
+            "time_stats.expert_mlp.median", label="expert_mlp"
+        )
+        if r:
+            results["train_test_split"]["expert_mlp"] = r
+
+    # ─── 5-Fold Cross-Validation ──────────────────────────────────────────
+    def evaluate_cv(df, feature_cols, target_col, filter_fn=None, label="", min_target=0.1):
+        """对单个算子类型做 5-fold CV。"""
+        if filter_fn is not None:
+            df = filter_fn(df)
+        if target_col not in df.columns or len(df) < 10:
+            return None
+
+        # 过滤掉目标值过小的样本
+        df = df[df[target_col] >= min_target]
+        if len(df) < 10:
+            return None
+
+        X = df[feature_cols].values.astype(float)
+        y = df[target_col].values.astype(float)
+
+        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        fold_mapes = []
+        for train_idx, test_idx in kf.split(X):
+            rf = RandomForestRegressor(n_estimators=50, max_depth=10, random_state=42)
+            rf.fit(X[train_idx], y[train_idx])
+            pred = rf.predict(X[test_idx])
+            mape = np.mean(np.abs(pred - y[test_idx]) / np.maximum(y[test_idx], 0.01)) * 100
+            fold_mapes.append(mape)
+
+        return {
+            "label": label,
+            "n_total": len(X),
+            "cv_mean_mape": round(np.mean(fold_mapes), 2),
+            "cv_std_mape": round(np.std(fold_mapes), 2),
+            "fold_mapes": [round(m, 2) for m in fold_mapes],
+        }
+
+    for op_label, op_df, feat_cols, target, filt in [
+        ("attn_decode", attn_df, ["batch_size", "kv_cache_size"],
+         "time_stats.attn_decode.median",
+         lambda d: d[d["is_prefill"] == False] if "is_prefill" in d.columns else d),
+        ("attn_prefill", attn_df, prefill_feat,
+         "time_stats.attn_prefill.median",
+         lambda d: d[d["is_prefill"] == True] if "is_prefill" in d.columns else d),
+        ("mlp", mlp_df, ["num_tokens"], "_mlp_total", None),
+        ("expert_mlp", expert_df, ["num_tokens", "batch_size"],
+         "time_stats.expert_mlp.median", None),
+    ]:
+        r = evaluate_cv(op_df, feat_cols, target, filt, op_label)
+        if r:
+            results["cross_validation"][op_label] = r
+
+    return results
 
 
 def load_generalization_results():
@@ -424,15 +580,29 @@ def main():
     print(f"  {len(df)} samples collected")
 
     # 2. Load E2E generalization
-    print("\n[2/3] Loading E2E generalization results...")
+    print("\n[2/4] Loading E2E generalization results...")
     gen_results = load_generalization_results()
     if gen_results:
         print(f"  {len(gen_results['comparisons'])} configs loaded")
     else:
         print("  No generalization results found")
 
-    # 3. Print summary
-    print("\n[3/3] Generating summary and figures...")
+    # 3. RF held-out evaluation
+    print("\n[3/4] Running RandomForest held-out evaluation...")
+    try:
+        rf_held_out = run_rf_held_out_evaluation()
+        print("  70/30 Split results:")
+        for op, r in rf_held_out.get("train_test_split", {}).items():
+            print(f"    {op}: train={r['train_mape']:.1f}%, test={r['test_mape']:.1f}% (n={r['n_total']})")
+        print("  5-Fold CV results:")
+        for op, r in rf_held_out.get("cross_validation", {}).items():
+            print(f"    {op}: CV MAPE={r['cv_mean_mape']:.1f}% ± {r['cv_std_mape']:.1f}%")
+    except Exception as e:
+        print(f"  RF held-out evaluation failed: {e}")
+        rf_held_out = None
+
+    # 4. Print summary
+    print("\n[4/4] Generating summary and figures...")
     print_summary(df, gen_results)
 
     # Generate figures
@@ -444,6 +614,7 @@ def main():
     output = {
         "operator_level": operator_results,
         "generalization": gen_results,
+        "rf_held_out": rf_held_out,
         "summary": {},
     }
 

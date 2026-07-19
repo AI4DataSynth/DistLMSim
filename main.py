@@ -62,7 +62,8 @@ class DisaggregatedSimulator:
     模拟 1 个 Prefill 节点 + 1 个 Decode 节点的推理服务：
     1. 请求到达 → Prefill 节点执行 prefill (批量)
     2. Prefill 完成 → KV Cache 通过 RDMA 传输到 Decode 节点
-    3. Decode 节点执行 decode (逐 token 迭代)
+    3. Decode 节点执行 continuous batching (iteration-level scheduling):
+       每步 admit 新请求 → 运行 ONE step → 移除完成请求
     4. 所有 decode token 生成完毕 → 请求完成
 
     通信建模：
@@ -180,8 +181,12 @@ class DisaggregatedSimulator:
     def _create_request(self, arrival_time: float) -> Request:
         """创建一个合成请求。"""
         req_config = self.config.request
-        prefill_tokens = self._sample_length(req_config.prefill_length)
-        decode_tokens = self._sample_length(req_config.decode_length)
+        prefill_tokens = self._sample_length(
+            req_config.prefill_length, req_config.prefill_length_cv
+        )
+        decode_tokens = self._sample_length(
+            req_config.decode_length, req_config.decode_length_cv
+        )
         req = Request(
             id=self._request_counter,
             arrival_time=arrival_time,
@@ -191,11 +196,11 @@ class DisaggregatedSimulator:
         self._request_counter += 1
         return req
 
-    def _sample_length(self, mean: int) -> int:
+    def _sample_length(self, mean: int, phase_cv: float = -1.0) -> int:
         dist = self.config.request.length_distribution
         if dist == "fixed":
             return mean
-        cv = self.config.request.length_cv
+        cv = phase_cv if phase_cv >= 0 else self.config.request.length_cv
         std = mean * cv
         return max(1, int(self._rng.normal(mean, std)))
 
@@ -581,13 +586,16 @@ class DisaggregatedSimulator:
         return selected
 
     def run(self) -> MetricsStore:
-        """运行完整的存算分离模拟 (实时队列调度)。
+        """运行完整的存算分离模拟 (continuous batching)。
 
         调度逻辑:
         1. 所有请求按到达时间排序
         2. 维护 prefill 等待队列: 请求到达后入队，prefill 节点空闲时按策略选取
         3. Prefill 完成后 KV Cache 通过 RDMA 传输，进入 decode 等待队列
-        4. Decode 节点空闲时按策略从 decode 队列中选取请求
+        4. Decode 阶段采用 continuous batching (iteration-level scheduling):
+           - 维护 active_decoding 持久字典，跨迭代保持
+           - 每步迭代: admit 新 KV-ready 请求 → 运行 ONE step → 移除完成请求
+           - batch 组成每步动态变化，与 vLLM/Orca 行为对齐
 
         调度策略只在"已形成队列"的请求中做选择，不做全局重排序。
         这是真实调度器的行为: 无法预知未来到达的请求。
@@ -698,18 +706,24 @@ class DisaggregatedSimulator:
                 f"queue_depth={len(prefill_waiting)}"
             )
 
-        # ─── Decode 阶段: 实时队列调度 ────────────────────────────────────
-        # 按 KV Cache 就绪时间排序所有请求，模拟到达 decode 队列
+        # ─── Decode 阶段: continuous batching (iteration-level) ─────────────
+        # 每步迭代: admit 新 KV-ready 请求 → 运行 ONE step → 移除完成请求
+        # 与 vLLM/Orca 的 continuous batching 对齐: batch 组成每步动态变化
         decode_candidates = sorted(all_requests, key=lambda r: kv_ready_time[r.id])
         decode_arrival_idx = 0
         decode_free_time = 0.0
         decode_waiting: List[Request] = []
+        active_decoding: Dict[int, Request] = {}  # 跨迭代持久的活跃 decode 请求
+        spec_engine = self._get_spec_engine()
 
-        while decode_arrival_idx < total_requests or decode_waiting:
+        while decode_arrival_idx < total_requests or decode_waiting or active_decoding:
             # 确定当前时间
-            if decode_waiting:
+            if active_decoding:
+                current_time = decode_free_time
+            elif decode_waiting:
                 current_time = decode_free_time
             else:
+                # 无活跃/等待请求，跳到下一个 KV-ready 时间
                 current_time = max(
                     decode_free_time,
                     kv_ready_time[decode_candidates[decode_arrival_idx].id]
@@ -721,66 +735,59 @@ class DisaggregatedSimulator:
                 decode_waiting.append(decode_candidates[decode_arrival_idx])
                 decode_arrival_idx += 1
 
-            if not decode_waiting:
+            # Admit: 按调度策略从等待队列选取，填充到 decode_bs 容量
+            available_slots = decode_bs - len(active_decoding)
+            if available_slots > 0 and decode_waiting:
+                admitted = self._select_from_queue(
+                    decode_waiting, available_slots, self._decode_policy,
+                    kv_ready_time=kv_ready_time,
+                    current_time=current_time
+                )
+                for req in admitted:
+                    decode_waiting.remove(req)
+                    req.status = RequestStatus.DECODING
+                    req.decode_node_id = self.ctx.decode_node_id
+                    req.decode_start_time = current_time
+                    ms.record_decode_start(req.id, current_time, self.ctx.decode_node_id)
+                    active_decoding[req.id] = req
+
+            if not active_decoding:
                 continue
 
-            # 按调度策略从队列中选取
-            decode_batch = self._select_from_queue(
-                decode_waiting, decode_bs, self._decode_policy,
-                kv_ready_time=kv_ready_time,
-                current_time=current_time
+            # Execute ONE decode step for all active requests
+            active_list = list(active_decoding.values())
+            result = spec_engine.compute_cycle(
+                active_list, current_time,
+                compute_standard_step_fn=self._compute_decode_step_time,
             )
-            for req in decode_batch:
-                decode_waiting.remove(req)
-                req.status = RequestStatus.DECODING
-                req.decode_node_id = self.ctx.decode_node_id
+            step_end = current_time + result.cycle_time_ms
 
-            # ─── 执行 Decode ──────────────────────────────────────────────
-            batch_ready = max(kv_ready_time[r.id] for r in decode_batch)
-            current_time = max(decode_free_time, batch_ready)
+            # Update each request and remove completed ones
+            completed_ids = []
+            for i, req in enumerate(active_list):
+                if result.per_request_accepted is not None:
+                    req_accepted = result.per_request_accepted[i]
+                else:
+                    req_accepted = result.accepted_tokens
+                req.num_generated_tokens += req_accepted
+                req.accepted_tokens_last_cycle = req_accepted
+                if result.is_speculative:
+                    req.total_spec_cycles += 1
+                    req.total_spec_accepted += req_accepted
+                if req.num_generated_tokens >= req.decode_tokens:
+                    req.decode_end_time = step_end
+                    req.status = RequestStatus.COMPLETED
+                    ms.record_decode_end(req.id, step_end)
+                    completed_ids.append(req.id)
 
-            # ─── 统一 Decode 循环 (draft-schedule-verify / 标准 decode) ──
-            spec_engine = self._get_spec_engine()
+            for req_id in completed_ids:
+                del active_decoding[req_id]
 
-            while True:
-                active = [r for r in decode_batch if r.num_generated_tokens < r.decode_tokens]
-                if not active:
-                    break
-
-                for req in active:
-                    if req.decode_start_time is None:
-                        req.decode_start_time = current_time
-                        ms.record_decode_start(req.id, current_time, self.ctx.decode_node_id)
-
-                # 统一 cycle: K=0 退化为标准 decode (1 token/step)
-                result = spec_engine.compute_cycle(
-                    active, current_time,
-                    compute_standard_step_fn=self._compute_decode_step_time,
-                )
-                step_end = current_time + result.cycle_time_ms
-
-                for i, req in enumerate(active):
-                    if result.per_request_accepted is not None:
-                        req_accepted = result.per_request_accepted[i]
-                    else:
-                        req_accepted = result.accepted_tokens
-                    req.num_generated_tokens += req_accepted
-                    req.accepted_tokens_last_cycle = req_accepted
-                    if result.is_speculative:
-                        req.total_spec_cycles += 1
-                        req.total_spec_accepted += req_accepted
-                    if req.num_generated_tokens >= req.decode_tokens:
-                        req.decode_end_time = step_end
-                        req.status = RequestStatus.COMPLETED
-                        ms.record_decode_end(req.id, step_end)
-
-                current_time = step_end
-
-            decode_free_time = current_time
+            decode_free_time = step_end
 
             logger.debug(
-                f"Decode batch: size={len(decode_batch)}, "
-                f"queue_depth={len(decode_waiting)}"
+                f"Decode iter: active={len(active_decoding)}, "
+                f"waiting={len(decode_waiting)}, step_time={result.cycle_time_ms:.2f}ms"
             )
 
         ms.finalize()
@@ -1249,6 +1256,57 @@ class ColocatedSimulator:
 
         return total_per_layer * model.num_layers
 
+    def _compute_chunked_mixed_batch_time(
+        self,
+        chunked_prefill_tokens: int,
+        prefill_reqs: List[Request],
+        decode_reqs: List[Request],
+    ) -> float:
+        """计算 chunked prefill + decode 混合 batch 的执行时间。
+
+        与 _compute_mixed_batch_time 的区别：prefill tokens 已经被 chunked，
+        只计算本 iteration 需要处理的 prefill chunk tokens。
+        """
+        if chunked_prefill_tokens == 0 and not decode_reqs:
+            return 0.0
+
+        decode_tokens = len(decode_reqs)
+        total_tokens = chunked_prefill_tokens + decode_tokens
+        total_batch_size = len(prefill_reqs) + len(decode_reqs)
+
+        if total_tokens == 0:
+            return 0.0
+
+        model = self.ctx.model_config
+
+        if chunked_prefill_tokens > 0:
+            avg_kv = 0
+            is_prefill = True
+        else:
+            avg_kv = sum(
+                r.prefill_tokens + r.num_generated_tokens for r in decode_reqs
+            ) // max(1, len(decode_reqs))
+            is_prefill = False
+
+        exec_time = self.ctx.time_predictor.get_execution_time(
+            num_tokens=total_tokens,
+            batch_size=total_batch_size,
+            kv_cache_size=avg_kv,
+            is_prefill=is_prefill,
+        )
+
+        if exec_time.expert_mlp_time > 0:
+            imbalance_factor = self._compute_moe_imbalance_factor(total_tokens)
+            adjusted_total = exec_time.total_time + exec_time.expert_mlp_time * (imbalance_factor - 1.0)
+        else:
+            adjusted_total = exec_time.total_time
+
+        per_layer_time = adjusted_total
+        tp_comm = self._compute_tp_allreduce_time(total_tokens)
+        total_per_layer = self._apply_tp_overlap(per_layer_time, tp_comm)
+
+        return total_per_layer * model.num_layers
+
     def _select_from_queue(
         self,
         waiting_queue: List[Request],
@@ -1321,7 +1379,12 @@ class ColocatedSimulator:
         waiting_queue: List[Request] = []
         prefilling: Dict[int, Request] = {}   # req.id -> Request (正在 prefill)
         decoding: Dict[int, Request] = {}     # req.id -> Request (正在 decode)
+        prefill_progress: Dict[int, int] = {}  # req.id -> tokens processed so far
         current_time = 0.0
+
+        dcfg = self.config.disaggregated
+        chunked = dcfg.enable_chunked_prefill and dcfg.prefill_chunk_size > 0
+        chunk_size = dcfg.prefill_chunk_size if chunked else float('inf')
 
         while arrival_idx < total_requests or waiting_queue or prefilling or decoding:
             # 将所有已到达的请求加入等待队列
@@ -1329,9 +1392,13 @@ class ColocatedSimulator:
                 waiting_queue.append(all_requests[arrival_idx])
                 arrival_idx += 1
 
-            # 选取新请求做 prefill
+            # 选取新请求做 prefill (仅当没有正在 chunked prefill 的请求时)
             prefill_batch = []
-            if waiting_queue:
+            has_ongoing_prefill = any(
+                prefill_progress.get(r.id, 0) < r.prefill_tokens
+                for r in prefilling.values()
+            )
+            if waiting_queue and not has_ongoing_prefill:
                 prefill_candidates = self._select_from_queue(
                     waiting_queue, max_prefill_per_iter, self._policy, current_time
                 )
@@ -1342,11 +1409,25 @@ class ColocatedSimulator:
                     req.prefill_start_time = current_time
                     ms.record_prefill_start(req.id, current_time, 0)
                     prefill_batch.append(req)
+                    prefilling[req.id] = req
+                    prefill_progress[req.id] = 0
+
+            # 计算本 iteration 的 chunked prefill tokens
+            chunked_prefill_tokens = 0
+            completed_prefill = []
+            for req in list(prefilling.values()):
+                done = prefill_progress.get(req.id, 0)
+                remaining = req.prefill_tokens - done
+                this_chunk = min(remaining, int(chunk_size))
+                chunked_prefill_tokens += this_chunk
+                if done + this_chunk >= req.prefill_tokens:
+                    completed_prefill.append(req)
 
             # Decode batch: 所有已 prefill 完成但 decode 未完成的请求
             decode_batch = list(decoding.values())
 
-            if not prefill_batch and not decode_batch:
+            # 如果没有 chunked prefill 也没有 decode
+            if not chunked_prefill_tokens and not decode_batch:
                 # 无活跃请求，跳到下一个到达时间
                 if arrival_idx < total_requests:
                     current_time = all_requests[arrival_idx].arrival_time
@@ -1354,12 +1435,21 @@ class ColocatedSimulator:
                 else:
                     break
 
-            # 执行混合 batch
-            step_time = self._compute_mixed_batch_time(prefill_batch, decode_batch)
+            # 执行混合 batch (chunked prefill tokens + decode)
+            step_time = self._compute_chunked_mixed_batch_time(
+                chunked_prefill_tokens, prefill_batch, decode_batch
+            )
             step_end = current_time + step_time
 
+            # 更新 prefill 进度
+            for req in prefilling.values():
+                done = prefill_progress.get(req.id, 0)
+                remaining = req.prefill_tokens - done
+                this_chunk = min(remaining, int(chunk_size))
+                prefill_progress[req.id] = done + this_chunk
+
             # Prefill 完成的请求 → 进入 decode
-            for req in prefill_batch:
+            for req in completed_prefill:
                 req.prefill_end_time = step_end
                 ms.record_prefill_end(req.id, step_end)
                 req.status = RequestStatus.DECODING
@@ -1369,6 +1459,8 @@ class ColocatedSimulator:
                 ms.record_kv_cache_transfer_start(req.id, step_end)
                 ms.record_kv_cache_transfer_end(req.id, step_end)  # colocated: 0 delay
                 decoding[req.id] = req
+                del prefilling[req.id]
+                del prefill_progress[req.id]
 
             # Decode step: 每个活跃请求生成 1 个 token
             completed_ids = []
@@ -1409,14 +1501,22 @@ def create_colocated_simulator(
     seed: int = 42,
     schedule_policy: str = "fcfs",
     length_distribution: str = "fixed",
+    length_cv: float = 0.3,
+    prefill_length_cv: float = -1.0,
+    decode_length_cv: float = -1.0,
+    workload: Optional[str] = None,
     profiling_dir: Optional[str] = None,
     predictor_type: str = "auto",
 ) -> ColocatedSimulator:
     """快速创建 Colocated (非分离) 模拟器。
 
     集群拓扑: 1 节点 num_gpus_per_node 张 A800, prefill + decode 共享。
-    
+
     Args:
+        length_cv: 通用变异系数 (normal/lognormal 分布)
+        prefill_length_cv: prefill 专用 CV (-1 = 使用 length_cv)
+        decode_length_cv: decode 专用 CV (-1 = 使用 length_cv)
+        workload: Vidur workload 名称 ("chat-1m", "arxiv-4k", "bwb-4k")
         profiling_dir: profiling 数据目录路径（可选）
         predictor_type: 预测器类型 ("auto", "analytical", "profiled", "random_forest", "high_fidelity")
     """
@@ -1465,9 +1565,17 @@ def create_colocated_simulator(
             prefill_length=prefill_length,
             decode_length=decode_length,
             length_distribution=length_distribution,
+            length_cv=length_cv,
+            prefill_length_cv=prefill_length_cv,
+            decode_length_cv=decode_length_cv,
         ),
         metrics=metrics_config,
     )
+
+    # Apply Vidur workload if specified
+    if workload:
+        from distlmsim.workloads import apply_workload
+        apply_workload(config, workload)
 
     return ColocatedSimulator(ctx, config, schedule_policy=schedule_policy)
 
@@ -1493,14 +1601,23 @@ def create_disaggregated_simulator(
     prefill_schedule_policy: str = "fcfs",
     decode_schedule_policy: str = "fcfs",
     length_distribution: str = "fixed",
+    length_cv: float = 0.3,
+    prefill_length_cv: float = -1.0,
+    decode_length_cv: float = -1.0,
+    workload: Optional[str] = None,
     profiling_dir: Optional[str] = None,
     predictor_type: str = "auto",
 ) -> DisaggregatedSimulator:
     """快速创建存算分离模拟器。
 
     集群拓扑: 1 Prefill 节点 + 1 Decode 节点，每节点 num_gpus_per_node 张 A800。
-    
+
     Args:
+        length_cv: 通用变异系数 (normal/lognormal 分布)
+        prefill_length_cv: prefill 专用 CV (-1 = 使用 length_cv)
+        decode_length_cv: decode 专用 CV (-1 = 使用 length_cv)
+        workload: Vidur workload 名称 ("chat-1m", "arxiv-4k", "bwb-4k")，
+                  设置后覆盖 prefill_length/decode_length/CV 参数
         profiling_dir: profiling 数据目录路径（可选）
         predictor_type: 预测器类型 ("auto", "analytical", "profiled", "random_forest", "high_fidelity")
     """
@@ -1549,9 +1666,17 @@ def create_disaggregated_simulator(
             prefill_length=prefill_length,
             decode_length=decode_length,
             length_distribution=length_distribution,
+            length_cv=length_cv,
+            prefill_length_cv=prefill_length_cv,
+            decode_length_cv=decode_length_cv,
         ),
         metrics=metrics_config,
     )
+
+    # Apply Vidur workload if specified (overrides prefill/decode length and CV)
+    if workload:
+        from distlmsim.workloads import apply_workload
+        apply_workload(config, workload)
 
     return DisaggregatedSimulator(
         ctx, config,

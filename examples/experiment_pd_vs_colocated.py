@@ -74,6 +74,8 @@ def run_single_config(
     time_limit: float,
     seed: int,
     length_distribution: str,
+    workload: str = None,
+    length_cv: float = 0.5,
 ) -> Dict:
     """运行一组 PD Disagg + Colocated 对比。"""
 
@@ -91,6 +93,8 @@ def run_single_config(
         time_limit_s=time_limit,
         seed=seed,
         length_distribution=length_distribution,
+        length_cv=length_cv,
+        workload=workload,
     )
     ms_d = sim_d.run()
     results["disaggregated"] = extract_metrics(ms_d)
@@ -107,6 +111,8 @@ def run_single_config(
         time_limit_s=time_limit,
         seed=seed,
         length_distribution=length_distribution,
+        length_cv=length_cv,
+        workload=workload,
     )
     ms_c = sim_c.run()
     results["colocated"] = extract_metrics(ms_c)
@@ -131,7 +137,7 @@ def plot_results(results: List[Dict], output_dir: Path):
     qps_list = [r["qps"] for r in results]
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle("PD Disaggregated vs Colocated Deployment", fontsize=24)
+    fig.suptitle("Disaggregated vs Colocated Deployment", fontsize=24)
 
     metrics = [
         ("ttft_p50", "TTFT P50 (ms)", axes[0, 0]),
@@ -149,7 +155,7 @@ def plot_results(results: List[Dict], output_dir: Path):
         x = np.arange(len(qps_list))
         width = 0.35
 
-        ax.bar(x - width/2, d_vals, width, label='PD Disagg', color='#E74C3C', alpha=0.8)
+        ax.bar(x - width/2, d_vals, width, label='Disagg', color='#E74C3C', alpha=0.8)
         ax.bar(x + width/2, c_vals, width, label='Colocated', color='#3498DB', alpha=0.8)
 
         ax.set_xlabel("QPS")
@@ -181,6 +187,9 @@ def main():
     parser.add_argument("--length_distribution", type=str, default="normal",
                         help="长度分布: fixed 或 normal")
     parser.add_argument("--length_cv", type=float, default=0.5)
+    parser.add_argument("--workload", type=str, default=None,
+                        choices=["chat-1m", "arxiv-4k", "bwb-4k", "default"],
+                        help="Vidur workload trace (覆盖 prefill/decode/CV 参数)")
     parser.add_argument("--output_dir", type=str, default="results")
 
     args = parser.parse_args()
@@ -220,6 +229,8 @@ def main():
             time_limit=args.time_limit,
             seed=args.seed,
             length_distribution=args.length_distribution,
+            workload=args.workload,
+            length_cv=args.length_cv,
         )
 
         d = r["disaggregated"]

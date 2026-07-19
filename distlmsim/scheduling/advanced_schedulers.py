@@ -93,8 +93,8 @@ class POState:
 
 @dataclass
 class OPTState:
-    """OPT 调度器状态"""
-    prediction_error_std: float = 0.3  # 预测误差标准差
+    """OPT 调度器状态 (true oracle: 完美预知剩余 token 数)"""
+    prediction_error_std: float = 0.0  # oracle 无预测误差
     starvation_limit: int = 100  # 饥饿限制 (迭代次数)
     promotion_period: int = 10  # 提升周期
     

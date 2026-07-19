@@ -846,10 +846,15 @@ class HighFidelityPredictor(ExecutionTimePredictor):
         # Decode: fixed fusion (batch size varies in continuous batching, hard to model)
         if is_prefill:
             base_fusion = self._prefill_fusion_factor
-            ref_size = self._prefill_ref_size
-            size = max(num_tokens, 1)
-            fusion = base_fusion * (size / ref_size) ** (-self._fusion_alpha)
-            fusion = max(0.1, min(fusion, 1.0))
+            if base_fusion >= 1.0:
+                # Operator-level comparison mode: no fusion correction
+                fusion = 1.0
+            else:
+                # E2E mode: size-dependent fusion scaling
+                ref_size = self._prefill_ref_size
+                size = max(num_tokens, 1)
+                fusion = base_fusion * (size / ref_size) ** (-self._fusion_alpha)
+                fusion = max(0.1, min(fusion, 1.0))
         else:
             fusion = self._decode_fusion_factor
 
@@ -863,6 +868,18 @@ class HighFidelityPredictor(ExecutionTimePredictor):
                 & (self._attn_df["is_prefill"] == is_prefill)
             )
             attn_rows = self._attn_df[attn_mask]
+
+            # Prefill batch_size 不精确匹配: 回退到最近的 batch_size
+            if len(attn_rows) == 0 and is_prefill:
+                pf_df = self._attn_df[self._attn_df["is_prefill"] == True]
+                if len(pf_df) > 0:
+                    available_bs = pf_df["batch_size"].unique()
+                    nearest_bs = available_bs[np.argmin(np.abs(available_bs - batch_size))]
+                    attn_mask = (
+                        (self._attn_df["batch_size"] == nearest_bs)
+                        & (self._attn_df["is_prefill"] == True)
+                    )
+                    attn_rows = self._attn_df[attn_mask]
 
             if len(attn_rows) > 0:
                 if is_prefill:
@@ -1014,6 +1031,233 @@ class HighFidelityPredictor(ExecutionTimePredictor):
         return et
 
 
+class FusedKernelPredictor(ExecutionTimePredictor):
+    """Fused Kernel Predictor：直接查表 vLLM 的 fused kernel 执行时间。
+
+    模拟器的最小执行单元 = vLLM 的不可分割 CUDA kernel launch。
+    Profiling 直接在 vLLM 生产执行路径中测量每个 fused kernel（如 fused QKV GEMM、
+    FlashInfer attention、fused gate+up GEMM 等），无需 kernel fusion 校正因子。
+
+    与 HighFidelityPredictor 的区别：
+    - HighFidelityPredictor: 测量独立子操作 + 乘以 fusion factor 校正 → 需要调参
+    - FusedKernelPredictor: 直接测量 fused kernel → 零校正，零调参
+
+    CSV 格式 (fused_kernels.csv):
+        phase, num_tokens, batch_size, kv_cache_size, layer,
+        layer_mean, input_ln_mean, qkv_proj_mean, self_attn_mean,
+        o_proj_mean, post_ln_mean, gate_up_mean, act_fn_mean,
+        down_proj_mean, mlp_mean, ...
+    """
+
+    # Fused kernel 名称 → CSV 列名（.mean 后缀）
+    _FUSED_KERNELS = [
+        "input_ln", "qkv_proj", "self_attn", "o_proj",
+        "post_ln", "gate_up", "act_fn", "down_proj", "mlp", "layer",
+    ]
+
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        device_config: DeviceSKUConfig,
+        profiling_dir: str,
+    ):
+        import pandas as pd
+
+        self._model = model_config
+        self._device = device_config
+        self._profiling_dir = profiling_dir
+        self._fallback = HighFidelityPredictor(model_config, device_config, profiling_dir)
+
+        # 查找 fused_kernels.csv — model-specific first, then generic
+        self._df = None
+        self._is_moe = False
+        model_name_lower = model_config.model_name.lower()
+
+        # Build candidate list: model-specific CSVs only match their model
+        candidates = []
+        if "qwen" in model_name_lower:
+            candidates = [
+                os.path.join(profiling_dir, "fused_kernels_a800_qwen3.csv"),
+                os.path.join(profiling_dir, "fused_kernels_qwen3.csv"),
+            ]
+        elif "llama" in model_name_lower:
+            candidates = [
+                os.path.join(profiling_dir, "fused_kernels_a800_llama3.csv"),
+                os.path.join(profiling_dir, "fused_kernels_a800.csv"),
+                os.path.join(profiling_dir, "fused_kernels_llama3.csv"),
+            ]
+        # Generic fallbacks (only for unnamed/unknown models)
+        if not candidates:
+            candidates = [
+                os.path.join(profiling_dir, "fused_kernels.csv"),
+                os.path.join(profiling_dir, "fused_kernels_h100.csv"),
+                os.path.join(profiling_dir, "fused_kernels_a800.csv"),
+            ]
+
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                self._df = pd.read_csv(candidate)
+                self._is_moe = "gate_up_mean" not in self._df.columns
+                logger.info("FusedKernelPredictor: loaded %s (%d rows, %s)",
+                            candidate, len(self._df),
+                            "MoE" if self._is_moe else "dense")
+                break
+
+        if self._df is None:
+            logger.warning("FusedKernelPredictor: no fused_kernels CSV found for %s, "
+                           "falling back to HighFidelityPredictor",
+                           model_config.model_name)
+
+        self._cache: Dict[Tuple, ExecutionTime] = {}
+
+    def get_execution_time(
+        self,
+        num_tokens: int,
+        batch_size: int,
+        kv_cache_size: int,
+        is_prefill: bool = False,
+    ) -> ExecutionTime:
+        cache_key = (num_tokens, batch_size, kv_cache_size, is_prefill)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        et = self._lookup(num_tokens, batch_size, kv_cache_size, is_prefill)
+        self._cache[cache_key] = et
+        return et
+
+    def _lookup(
+        self,
+        num_tokens: int,
+        batch_size: int,
+        kv_cache_size: int,
+        is_prefill: bool,
+    ) -> ExecutionTime:
+        """从 fused_kernels.csv 直接查表，无 fusion factor。"""
+        import pandas as pd
+
+        if self._df is None:
+            return self._fallback.get_execution_time(
+                num_tokens, batch_size, kv_cache_size, is_prefill)
+
+        phase = "prefill" if is_prefill else "decode"
+        mask = self._df["phase"] == phase
+
+        if is_prefill:
+            # Match by num_tokens (prefill chunk size)
+            if "num_tokens" in self._df.columns:
+                nt_vals = self._df.loc[mask, "num_tokens"].unique()
+                closest_nt = nt_vals[np.argmin(np.abs(nt_vals - num_tokens))]
+                mask = mask & (self._df["num_tokens"] == closest_nt)
+        else:
+            # Match by batch_size and kv_cache_size
+            if "batch_size" in self._df.columns:
+                bs_vals = self._df.loc[mask, "batch_size"].unique()
+                closest_bs = bs_vals[np.argmin(np.abs(bs_vals - batch_size))]
+                mask = mask & (self._df["batch_size"] == closest_bs)
+            if "kv_cache_size" in self._df.columns:
+                kv_vals = self._df.loc[mask, "kv_cache_size"].unique()
+                closest_kv = kv_vals[np.argmin(np.abs(kv_vals - kv_cache_size))]
+                mask = mask & (self._df["kv_cache_size"] == closest_kv)
+
+        rows = self._df[mask]
+        if len(rows) == 0:
+            return self._fallback.get_execution_time(
+                num_tokens, batch_size, kv_cache_size, is_prefill)
+
+        # Average across layers (all layers should have similar timing)
+        et = ExecutionTime()
+
+        def _get_mean(kernel_name):
+            col = f"{kernel_name}_mean"
+            if col in rows.columns:
+                return float(rows[col].mean())
+            return 0.0
+
+        # ── Map fused kernels to ExecutionTime fields ──
+        # Strategy: use layer_mean (total per-layer time) as the primary
+        # measurement. Distribute it across ExecutionTime fields so that
+        # attention_time + mlp_time + layernorms + overhead = layer_mean.
+        #
+        # self_attn: full attention block (qkv_proj + rope + flashinfer + kv_cache + o_proj)
+        # This is the indivisible attention execution unit in vLLM.
+        self_attn_time = _get_mean("self_attn")
+        input_ln_time = _get_mean("input_ln")
+        post_ln_time = _get_mean("post_ln")
+        layer_total = _get_mean("layer")
+
+        # Set attention time
+        if is_prefill:
+            et.attn_prefill_time = self_attn_time
+        else:
+            et.attn_decode_time = self_attn_time
+        # qkv_proj, o_proj are INSIDE self_attn → set to 0 to avoid double-counting
+        et.attn_pre_proj_time = 0.0
+        et.attn_rope_time = 0.0
+        et.attn_kv_cache_save_time = 0.0
+        et.attn_post_proj_time = 0.0
+        et.attn_input_reshape_time = 0.0
+        et.attn_output_reshape_time = 0.0
+
+        # LayerNorms
+        et.input_layernorm_time = input_ln_time
+        et.post_attention_layernorm_time = post_ln_time
+
+        if self._is_moe:
+            # MoE model: mlp_mean = total MoE block time (gate + experts + routing)
+            # No individual sub-kernel decomposition; treat MoE as atomic fused kernel.
+            mlp_total_time = _get_mean("mlp")
+            et.mlp_up_proj_time = mlp_total_time
+            et.mlp_act_time = 0.0
+            et.mlp_down_proj_time = 0.0
+
+            # Scale: self_attn + mlp_total + input_ln + post_ln → layer_total
+            accounted = self_attn_time + mlp_total_time + input_ln_time + post_ln_time
+            if layer_total > 0 and accounted > 0:
+                scale = layer_total / accounted
+                if is_prefill:
+                    et.attn_prefill_time *= scale
+                else:
+                    et.attn_decode_time *= scale
+                et.mlp_up_proj_time *= scale
+                et.input_layernorm_time *= scale
+                et.post_attention_layernorm_time *= scale
+            elif layer_total > 0:
+                if is_prefill:
+                    et.attn_prefill_time = layer_total
+                else:
+                    et.attn_decode_time = layer_total
+        else:
+            # Dense model: individually measured fused GEMMs/kernels
+            gate_up_time = _get_mean("gate_up")
+            act_fn_time = _get_mean("act_fn")
+            down_proj_time = _get_mean("down_proj")
+            et.mlp_up_proj_time = gate_up_time
+            et.mlp_act_time = act_fn_time
+            et.mlp_down_proj_time = down_proj_time
+
+            # Scale sub-module times so they sum to layer_total.
+            mlp_sub_sum = gate_up_time + act_fn_time + down_proj_time
+            accounted = self_attn_time + mlp_sub_sum + input_ln_time + post_ln_time
+            if layer_total > 0 and accounted > 0:
+                scale = layer_total / accounted
+                if is_prefill:
+                    et.attn_prefill_time *= scale
+                else:
+                    et.attn_decode_time *= scale
+                et.mlp_up_proj_time *= scale
+                et.mlp_act_time *= scale
+                et.mlp_down_proj_time *= scale
+                et.input_layernorm_time *= scale
+                et.post_attention_layernorm_time *= scale
+            elif layer_total > 0:
+                if is_prefill:
+                    et.attn_prefill_time = layer_total
+                else:
+                    et.attn_decode_time = layer_total
+
+        return et
+
+
 def create_predictor(
     model_config: ModelConfig,
     device_config: DeviceSKUConfig,
@@ -1026,12 +1270,14 @@ def create_predictor(
         model_config: 模型配置
         device_config: 设备配置
         profiling_dir: profiling 数据目录路径（可选）
-        predictor_type: 预测器类型 ("auto", "analytical", "profiled", "random_forest", "high_fidelity")
+        predictor_type: 预测器类型 ("auto", "analytical", "profiled", "random_forest",
+            "high_fidelity", "fused_kernel")
             - "auto": 根据 profiling_dir 自动选择（默认）
             - "analytical": 强制使用 AnalyticalPredictor
             - "profiled": 强制使用 ProfilingBasedPredictor（需要 profiling_dir）
             - "random_forest": 强制使用 RandomForestPredictor（需要 profiling_dir）
-            - "high_fidelity": 使用 HighFidelityPredictor（精确查表，需要 profiling_dir）
+            - "high_fidelity": 使用 HighFidelityPredictor（精确查表 + fusion factor）
+            - "fused_kernel": 使用 FusedKernelPredictor（直接查表 fused kernel，无 fusion factor）
 
     Returns:
         ExecutionTimePredictor 实例
@@ -1069,6 +1315,13 @@ def create_predictor(
             return AnalyticalPredictor(model_config, device_config)
         logger.info("使用 HighFidelityPredictor（精确查表模式），数据目录: %s", profiling_dir)
         return HighFidelityPredictor(model_config, device_config, profiling_dir)
+
+    elif predictor_type == "fused_kernel":
+        if not has_csv:
+            logger.warning("请求 FusedKernelPredictor 但 profiling 目录无效，回退到 AnalyticalPredictor")
+            return AnalyticalPredictor(model_config, device_config)
+        logger.info("使用 FusedKernelPredictor（fused kernel 直接查表），数据目录: %s", profiling_dir)
+        return FusedKernelPredictor(model_config, device_config, profiling_dir)
 
     else:  # auto
         if has_csv:
