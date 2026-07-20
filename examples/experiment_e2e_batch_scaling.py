@@ -30,7 +30,7 @@ from distlmsim.types import RDMAProtocolType
 from distlmsim.execution.execution_time_predictor import FusedKernelPredictor
 from main import ColocatedSimulator
 
-PROFILING_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "profiling")
+PROFILING_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "profiling", "vllm")
 
 # Correction factors (from E2E validation against vLLM)
 # Decode: vLLM achieves constant ~43ms decode step time regardless of batch size.
