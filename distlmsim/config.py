@@ -154,6 +154,8 @@ class DisaggregatedConfig:
     # Chunked Prefill
     enable_chunked_prefill: bool = True
     prefill_chunk_size: int = 4096
+    # Token Budget (vLLM max_num_batched_tokens 等价)
+    max_num_batched_tokens: int = 16384  # 每 iteration 最大 token 总数 (prefill+decode)
     # Speculative Decoding
     enable_speculative_decoding: bool = False
     speculation_length: int = 4         # Draft model 生成的 candidate token 数 K

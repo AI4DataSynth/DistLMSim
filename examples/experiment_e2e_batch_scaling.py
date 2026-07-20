@@ -41,7 +41,7 @@ DECODE_CORRECTION_BS1 = 0.308  # at bs=1: 2.65/2.750 = 0.963... wait
 # Actually: target TBT = 43ms = correction * profiling_time * 48 layers
 # correction = 43 / (profiling_time * 48) = 0.896 / profiling_time
 # At bs=1: correction = 0.896 / 2.750 = 0.326 ≈ 0.308 (close enough)
-DECODE_CORRECTION = 0.308  # fallback for single-request mode
+DECODE_CORRECTION = 0.620  # fallback for single-request mode
 PREFILL_CORRECTION_MAP = {64: 0.40, 128: 0.394, 256: 0.130, 512: 0.118, 1024: 0.111}
 # Target decode TBT from vLLM measurements (ms)
 _VLLM_TARGET_TBT_MS = 43.0
@@ -153,6 +153,7 @@ def run_config(pf, qps, decode_length=128, time_limit_s=30.0, seed=42,
             gpu_memory_utilization=0.9,
             enable_chunked_prefill=True,
             prefill_chunk_size=chunk_size,
+            max_num_batched_tokens=2048,
         ),
         metrics=MetricsConfig(enable_detailed_logging=False),
     )

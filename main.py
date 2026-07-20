@@ -1434,6 +1434,14 @@ class ColocatedSimulator:
             max_decode_bs = self.config.disaggregated.decode_batch_size
             decode_batch = all_decoding[:max_decode_bs] if len(all_decoding) > max_decode_bs else all_decoding
 
+            # Token budget: prefill tokens + decode tokens ≤ max_num_batched_tokens
+            # (matches vLLM's max_num_batched_tokens constraint)
+            max_tokens = self.config.disaggregated.max_num_batched_tokens
+            decode_tokens = len(decode_batch)
+            remaining_budget = max(0, max_tokens - decode_tokens)
+            if chunked_prefill_tokens > remaining_budget:
+                chunked_prefill_tokens = remaining_budget
+
             # 如果没有 chunked prefill 也没有 decode
             if not chunked_prefill_tokens and not decode_batch:
                 # 无活跃请求，跳到下一个到达时间
