@@ -1125,6 +1125,120 @@ class FusedKernelPredictor(ExecutionTimePredictor):
         self._cache[cache_key] = et
         return et
 
+    def _interp_1d(self, phase_mask, col_name, dim_col, dim_val):
+        """Log-linear interpolation along a single dimension.
+
+        Given a phase-filtered DataFrame, interpolate ``col_name`` at
+        ``dim_val`` using the two nearest bounding values of ``dim_col``
+        (log-space interpolation since batch/token counts span orders of
+        magnitude).  Falls back to nearest-neighbor when only one side
+        is available.
+        """
+        import pandas as pd
+
+        if col_name not in self._df.columns:
+            return 0.0
+        sub = self._df.loc[phase_mask].copy()
+        if len(sub) == 0:
+            return 0.0
+
+        # Average per dim value (across layers)
+        grouped = sub.groupby(dim_col)[col_name].mean()
+        dim_vals = np.sort(grouped.index.values.astype(float))
+        dim_means = np.array([grouped[v] for v in dim_vals])
+
+        x = float(dim_val)
+        if x <= dim_vals[0]:
+            return float(dim_means[0])
+        if x >= dim_vals[-1]:
+            # Linear extrapolation using last two points
+            if len(dim_vals) >= 2:
+                x0, x1 = np.log(dim_vals[-2]), np.log(dim_vals[-1])
+                y0, y1 = dim_means[-2], dim_means[-1]
+                slope = (y1 - y0) / max(x1 - x0, 1e-9)
+                return float(max(0, y1 + slope * (np.log(x) - x1)))
+            return float(dim_means[-1])
+
+        # Find bounding indices
+        idx = np.searchsorted(dim_vals, x)
+        lo, hi = idx - 1, idx
+        x0, x1 = np.log(dim_vals[lo]), np.log(dim_vals[hi])
+        y0, y1 = dim_means[lo], dim_means[hi]
+        t = (np.log(x) - x0) / max(x1 - x0, 1e-9)
+        return float(y0 + t * (y1 - y0))
+
+    def _interp_2d(self, phase_mask, col_name, bs, kv):
+        """Bilinear interpolation over (batch_size, kv_cache_size).
+
+        Uses log-space for batch_size, linear-space for kv_cache_size.
+        """
+        import pandas as pd
+
+        if col_name not in self._df.columns:
+            return 0.0
+        sub = self._df.loc[phase_mask].copy()
+        if len(sub) == 0:
+            return 0.0
+
+        bs_col, kv_col = "batch_size", "kv_cache_size"
+        if bs_col not in sub.columns or kv_col not in sub.columns:
+            return self._interp_1d(phase_mask, col_name,
+                                   bs_col if bs_col in sub.columns else kv_col,
+                                   bs if bs_col in sub.columns else kv)
+
+        # Build pivot: mean(col_name) per (bs, kv) pair
+        pivot = sub.groupby([bs_col, kv_col])[col_name].mean()
+        bs_vals = np.sort(pivot.index.get_level_values(0).unique().astype(float))
+        kv_vals = np.sort(pivot.index.get_level_values(1).unique().astype(float))
+
+        def _get(bs_v, kv_v):
+            try:
+                return pivot.loc[(int(bs_v), int(kv_v))]
+            except KeyError:
+                return None
+
+        def _interp_bs(kv_fixed, x):
+            """Interpolate along batch_size at fixed kv_cache_size."""
+            pts = [(bv, _get(bv, kv_fixed)) for bv in bs_vals]
+            pts = [(b, v) for b, v in pts if v is not None]
+            if not pts:
+                return 0.0
+            if len(pts) == 1 or x <= pts[0][0]:
+                return pts[0][1]
+            if x >= pts[-1][0]:
+                b0, b1 = np.log(pts[-2][0]), np.log(pts[-1][0])
+                v0, v1 = pts[-2][1], pts[-1][1]
+                slope = (v1 - v0) / max(b1 - b0, 1e-9)
+                return max(0, v1 + slope * (np.log(x) - b1))
+            idx = np.searchsorted([p[0] for p in pts], x)
+            lo, hi = idx - 1, idx
+            b0, b1 = np.log(pts[lo][0]), np.log(pts[hi][0])
+            v0, v1 = pts[lo][1], pts[hi][1]
+            t = (np.log(x) - b0) / max(b1 - b0, 1e-9)
+            return v0 + t * (v1 - v0)
+
+        x_bs, x_kv = float(bs), float(kv)
+
+        if len(kv_vals) == 1 or x_kv <= kv_vals[0]:
+            return _interp_bs(kv_vals[0], x_bs)
+        if x_kv >= kv_vals[-1]:
+            # Extrapolate kv linearly using last two kv points
+            v0 = _interp_bs(kv_vals[-2], x_bs)
+            v1 = _interp_bs(kv_vals[-1], x_bs)
+            dk = kv_vals[-1] - kv_vals[-2]
+            if dk > 0:
+                slope = (v1 - v0) / dk
+                return max(0, v1 + slope * (x_kv - kv_vals[-1]))
+            return v1
+
+        # Bilinear: interpolate kv at two bounding kv values, then interpolate bs
+        k_idx = np.searchsorted(kv_vals, x_kv)
+        klo, khi = kv_vals[k_idx - 1], kv_vals[k_idx]
+        v_lo = _interp_bs(klo, x_bs)
+        v_hi = _interp_bs(khi, x_bs)
+        t = (x_kv - klo) / max(khi - klo, 1e-9)
+        return v_lo + t * (v_hi - v_lo)
+
     def _lookup(
         self,
         num_tokens: int,
@@ -1132,7 +1246,7 @@ class FusedKernelPredictor(ExecutionTimePredictor):
         kv_cache_size: int,
         is_prefill: bool,
     ) -> ExecutionTime:
-        """从 fused_kernels.csv 直接查表，无 fusion factor。"""
+        """从 fused_kernels.csv 查表（带插值）。"""
         import pandas as pd
 
         if self._df is None:
@@ -1140,38 +1254,26 @@ class FusedKernelPredictor(ExecutionTimePredictor):
                 num_tokens, batch_size, kv_cache_size, is_prefill)
 
         phase = "prefill" if is_prefill else "decode"
-        mask = self._df["phase"] == phase
+        phase_mask = self._df["phase"] == phase
 
-        if is_prefill:
-            # Match by num_tokens (prefill chunk size)
-            if "num_tokens" in self._df.columns:
-                nt_vals = self._df.loc[mask, "num_tokens"].unique()
-                closest_nt = nt_vals[np.argmin(np.abs(nt_vals - num_tokens))]
-                mask = mask & (self._df["num_tokens"] == closest_nt)
-        else:
-            # Match by batch_size and kv_cache_size
-            if "batch_size" in self._df.columns:
-                bs_vals = self._df.loc[mask, "batch_size"].unique()
-                closest_bs = bs_vals[np.argmin(np.abs(bs_vals - batch_size))]
-                mask = mask & (self._df["batch_size"] == closest_bs)
-            if "kv_cache_size" in self._df.columns:
-                kv_vals = self._df.loc[mask, "kv_cache_size"].unique()
-                closest_kv = kv_vals[np.argmin(np.abs(kv_vals - kv_cache_size))]
-                mask = mask & (self._df["kv_cache_size"] == closest_kv)
-
-        rows = self._df[mask]
-        if len(rows) == 0:
+        if len(self._df.loc[phase_mask]) == 0:
             return self._fallback.get_execution_time(
                 num_tokens, batch_size, kv_cache_size, is_prefill)
 
-        # Average across layers (all layers should have similar timing)
+        # Use interpolation instead of nearest-neighbor
+        def _get_interp(kernel_name):
+            col = f"{kernel_name}_mean"
+            if is_prefill:
+                return self._interp_1d(phase_mask, col, "num_tokens",
+                                       num_tokens)
+            else:
+                return self._interp_2d(phase_mask, col, batch_size,
+                                       kv_cache_size)
+
         et = ExecutionTime()
 
         def _get_mean(kernel_name):
-            col = f"{kernel_name}_mean"
-            if col in rows.columns:
-                return float(rows[col].mean())
-            return 0.0
+            return _get_interp(kernel_name)
 
         # ── Map fused kernels to ExecutionTime fields ──
         # Strategy: use layer_mean (total per-layer time) as the primary

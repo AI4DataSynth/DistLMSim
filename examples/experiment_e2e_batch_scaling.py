@@ -33,8 +33,9 @@ from main import ColocatedSimulator
 PROFILING_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "profiling")
 
 # Correction factors (from single-request calibration)
-# CUDA graph eliminates a fixed fraction of kernel launch overhead
-# This ratio is approximately constant across batch sizes
+# vLLM's fused kernels (fused MoE, PagedAttention, etc.) are consistently
+# faster than HF Transformers' naive PyTorch ops by ~3.25× across all batch sizes.
+# This ratio is approximately constant → use a fixed correction factor.
 DECODE_CORRECTION = 0.308  # correction = actual_time / profiling_time
 PREFILL_CORRECTION_MAP = {256: 0.130, 512: 0.118, 1024: 0.111}
 
@@ -86,8 +87,20 @@ class _CorrectedPredictor:
 
 
 def run_config(pf, qps, decode_length=128, time_limit_s=30.0, seed=42,
-               chunk_size=128):
-    """运行单个高 QPS 配置，返回指标和 batch size 统计。"""
+               chunk_size=128, submit_mode="poisson", num_requests=None,
+               tp_size=4, decode_correction=DECODE_CORRECTION,
+               prefill_correction_map=PREFILL_CORRECTION_MAP,
+               profiling_dir=PROFILING_DIR):
+    """运行单个配置。
+
+    Args:
+        submit_mode: "poisson" (Poisson arrivals) or "bulk" (all at once).
+        num_requests: Override request count (bulk: qps * time_limit).
+        tp_size: Tensor parallelism degree.
+        decode_correction: Decode correction factor.
+        prefill_correction_map: Prefill correction factor map.
+        profiling_dir: Path to profiling CSV directory.
+    """
     model = ModelConfig(
         model_name="Qwen3-30B-A3B",
         num_layers=48, num_q_heads=32, num_kv_heads=4,
@@ -98,21 +111,29 @@ def run_config(pf, qps, decode_length=128, time_limit_s=30.0, seed=42,
     rdma = RDMAConfig(protocol=RDMAProtocolType.ROCE_V2, bandwidth_gbps=200.0)
     network = NetworkTopologyConfig(nvlink=nvlink, rdma=rdma)
 
-    base_predictor = FusedKernelPredictor(model, device, PROFILING_DIR)
-    predictor = _CorrectedPredictor(base_predictor, PREFILL_CORRECTION_MAP)
+    base_predictor = FusedKernelPredictor(model, device, profiling_dir)
+    predictor = _CorrectedPredictor(base_predictor, prefill_correction_map)
 
     ms = MetricsStore(MetricsConfig(enable_detailed_logging=False))
     ctx = SimContext(
         model_config=model, device_config=device, network_config=network,
-        num_gpus_per_node=4, tp_size=4,
+        num_gpus_per_node=tp_size, tp_size=tp_size,
         time_predictor=predictor, metrics_store=ms,
-        profiling_dir=PROFILING_DIR, predictor_type="fused_kernel",
+        profiling_dir=profiling_dir, predictor_type="fused_kernel",
     )
 
+    # In bulk mode, submit all requests nearly simultaneously
+    actual_qps = qps
+    actual_time_limit = time_limit_s
+    if submit_mode == "bulk":
+        n_req = num_requests if num_requests else int(qps * time_limit_s)
+        actual_qps = n_req * 100  # all arrive within ~10ms
+        actual_time_limit = max(time_limit_s, 120.0)
+
     config = SimulationConfig(
-        seed=seed, time_limit_s=time_limit_s,
+        seed=seed, time_limit_s=actual_time_limit,
         request=RequestGeneratorConfig(
-            qps=qps, prefill_length=pf, decode_length=decode_length,
+            qps=actual_qps, prefill_length=pf, decode_length=decode_length,
             length_distribution="fixed",
         ),
         disaggregated=DisaggregatedConfig(
@@ -176,14 +197,27 @@ def run_config(pf, qps, decode_length=128, time_limit_s=30.0, seed=42,
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="E2E Batch Size Scaling")
+    parser.add_argument("--submit_mode", type=str, default="poisson",
+                        choices=["poisson", "bulk"],
+                        help="Request submission mode")
+    parser.add_argument("--tp_size", type=int, default=4,
+                        help="Tensor parallelism degree")
+    parser.add_argument("--profiling_dir", type=str, default=PROFILING_DIR,
+                        help="Profiling CSV directory")
+    args = parser.parse_args()
+
     print()
     print("=" * 85)
-    print("  E2E Batch Size Scaling: ColocatedSimulator (chunked prefill)")
-    print("  A800 × 4 (TP=4), Qwen3-30B-A3B, correction factors applied")
+    print(f"  E2E Batch Size Scaling: ColocatedSimulator (chunked prefill)")
+    print(f"  A800 × {args.tp_size} (TP={args.tp_size}), Qwen3-30B-A3B")
+    print(f"  Submit mode: {args.submit_mode}")
     print("=" * 85)
     print()
     print(f"  Correction: decode={DECODE_CORRECTION}, prefill={PREFILL_CORRECTION_MAP}")
     print(f"  Chunked prefill: chunk_size=128")
+    print(f"  Profiling dir: {args.profiling_dir}")
     print()
 
     configs = [
@@ -199,7 +233,9 @@ def main():
 
     for pf, qps, tlim, label in configs:
         print(f"  {label:<25} ...", end=" ", flush=True)
-        r = run_config(pf=pf, qps=qps, time_limit_s=tlim)
+        r = run_config(pf=pf, qps=qps, time_limit_s=tlim,
+                       submit_mode=args.submit_mode, tp_size=args.tp_size,
+                       profiling_dir=args.profiling_dir)
         if r["completed"] == 0:
             print("FAILED (no completed requests)")
             continue

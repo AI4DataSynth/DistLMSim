@@ -1423,8 +1423,11 @@ class ColocatedSimulator:
                 if done + this_chunk >= req.prefill_tokens:
                     completed_prefill.append(req)
 
-            # Decode batch: 所有已 prefill 完成但 decode 未完成的请求
-            decode_batch = list(decoding.values())
+            # Decode batch: 已 prefill 完成但 decode 未完成的请求
+            # Cap at decode_batch_size to match vLLM's max batch constraint
+            all_decoding = list(decoding.values())
+            max_decode_bs = self.config.disaggregated.decode_batch_size
+            decode_batch = all_decoding[:max_decode_bs] if len(all_decoding) > max_decode_bs else all_decoding
 
             # 如果没有 chunked prefill 也没有 decode
             if not chunked_prefill_tokens and not decode_batch:
@@ -1462,15 +1465,15 @@ class ColocatedSimulator:
                 del prefilling[req.id]
                 del prefill_progress[req.id]
 
-            # Decode step: 每个活跃请求生成 1 个 token
+            # Decode step: 只有 decode_batch 中的请求参与 forward pass 并生成 token
             completed_ids = []
-            for req_id, req in decoding.items():
+            for req in decode_batch:
                 req.num_generated_tokens += 1
                 if req.num_generated_tokens >= req.decode_tokens:
                     req.decode_end_time = step_end
                     req.status = RequestStatus.COMPLETED
                     ms.record_decode_end(req.id, step_end)
-                    completed_ids.append(req_id)
+                    completed_ids.append(req.id)
 
             for req_id in completed_ids:
                 del decoding[req_id]
