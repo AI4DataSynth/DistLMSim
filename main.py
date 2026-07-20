@@ -1264,48 +1264,53 @@ class ColocatedSimulator:
     ) -> float:
         """计算 chunked prefill + decode 混合 batch 的执行时间。
 
-        与 _compute_mixed_batch_time 的区别：prefill tokens 已经被 chunked，
-        只计算本 iteration 需要处理的 prefill chunk tokens。
+        在 vLLM 中，prefill chunk 和 decode tokens 在同一次 forward pass
+        中处理。总时间由两者中较大的决定（compute-bound），而非 tokens
+        之和。因此分别计算 prefill 和 decode 时间，取 max。
         """
         if chunked_prefill_tokens == 0 and not decode_reqs:
             return 0.0
 
         decode_tokens = len(decode_reqs)
-        total_tokens = chunked_prefill_tokens + decode_tokens
-        total_batch_size = len(prefill_reqs) + len(decode_reqs)
-
-        if total_tokens == 0:
-            return 0.0
-
         model = self.ctx.model_config
 
+        # Compute prefill chunk time separately
+        prefill_time = 0.0
         if chunked_prefill_tokens > 0:
-            avg_kv = 0
-            is_prefill = True
-        else:
+            pf_exec = self.ctx.time_predictor.get_execution_time(
+                num_tokens=chunked_prefill_tokens,
+                batch_size=len(prefill_reqs),
+                kv_cache_size=0,
+                is_prefill=True,
+            )
+            pf_adj = pf_exec.total_time
+            if pf_exec.expert_mlp_time > 0:
+                imb = self._compute_moe_imbalance_factor(chunked_prefill_tokens)
+                pf_adj = pf_exec.total_time + pf_exec.expert_mlp_time * (imb - 1.0)
+            pf_tp = self._compute_tp_allreduce_time(chunked_prefill_tokens)
+            prefill_time = self._apply_tp_overlap(pf_adj, pf_tp) * model.num_layers
+
+        # Compute decode time separately
+        decode_time = 0.0
+        if decode_reqs:
             avg_kv = sum(
                 r.prefill_tokens + r.num_generated_tokens for r in decode_reqs
             ) // max(1, len(decode_reqs))
-            is_prefill = False
+            dc_exec = self.ctx.time_predictor.get_execution_time(
+                num_tokens=decode_tokens,
+                batch_size=len(decode_reqs),
+                kv_cache_size=avg_kv,
+                is_prefill=False,
+            )
+            dc_adj = dc_exec.total_time
+            if dc_exec.expert_mlp_time > 0:
+                imb = self._compute_moe_imbalance_factor(decode_tokens)
+                dc_adj = dc_exec.total_time + dc_exec.expert_mlp_time * (imb - 1.0)
+            dc_tp = self._compute_tp_allreduce_time(decode_tokens)
+            decode_time = self._apply_tp_overlap(dc_adj, dc_tp) * model.num_layers
 
-        exec_time = self.ctx.time_predictor.get_execution_time(
-            num_tokens=total_tokens,
-            batch_size=total_batch_size,
-            kv_cache_size=avg_kv,
-            is_prefill=is_prefill,
-        )
-
-        if exec_time.expert_mlp_time > 0:
-            imbalance_factor = self._compute_moe_imbalance_factor(total_tokens)
-            adjusted_total = exec_time.total_time + exec_time.expert_mlp_time * (imbalance_factor - 1.0)
-        else:
-            adjusted_total = exec_time.total_time
-
-        per_layer_time = adjusted_total
-        tp_comm = self._compute_tp_allreduce_time(total_tokens)
-        total_per_layer = self._apply_tp_overlap(per_layer_time, tp_comm)
-
-        return total_per_layer * model.num_layers
+        # In a mixed forward pass, the time is dominated by the larger component
+        return max(prefill_time, decode_time)
 
     def _select_from_queue(
         self,
